@@ -1,378 +1,664 @@
-"""
-PDF Equipment Extractor - V1
-Cloudflare Python Worker + FastAPI + Gemini REST API.
-
-V1 scope:
-- Receive one PDF as base64 JSON.
-- Send the PDF directly to Gemini's native PDF/document understanding.
-- Detect multiple equipment items in the same PDF.
-- Extract the Excel-oriented parameters agreed for the project.
-- Normalize missing values to "-".
-- Return structured JSON for frontend review.
-
-No permanent PDF storage and no Excel writing are included yet.
-"""
-
-from __future__ import annotations
-
-import base64
-import binascii
-import json
-import os
-from typing import Any
-
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
+from typing import Any
+import base64
+import json
+
 from workers import asgi
+from js import fetch
+
+
+# ============================================================
+# APP
+# ============================================================
 
 app = FastAPI(
     title="PDF Equipment Extractor",
     version="0.1.0",
-    docs_url="/docs",
-    redoc_url=None,
+    description="Extract equipment data from engineering PDF drawings using Gemini."
 )
 
-# V1 frontend is hosted on GitHub Pages, so cross-origin API calls are required.
-# For production, replace "*" with your exact GitHub Pages origin.
+
+# ============================================================
+# CORS
+# ============================================================
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
-MAX_PDF_BYTES = 15 * 1024 * 1024
-DEFAULT_MODEL = "gemini-3.5-flash-lite"
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+MAX_PDF_SIZE = 15 * 1024 * 1024  # 15 MB
+
 
 PARAMETER_KEYS = [
     "tag_no",
     "equipment_name",
     "type",
+
     "diameter",
     "diameter_od_id",
     "length",
     "length_remarks",
     "height",
+
     "insulation",
     "insulation_size",
     "insulation_type",
+
     "shell_pressure",
     "shell_min_temp",
     "shell_max_temp",
+
     "tube_pressure",
     "tube_min_temp",
     "tube_max_temp",
+
     "service_type",
     "service_description",
+
     "remarks",
 ]
 
 
+# ============================================================
+# REQUEST MODEL
+# ============================================================
+
 class AnalyzeRequest(BaseModel):
-    filename: str = Field(default="document.pdf")
-    mime_type: str = Field(default="application/pdf")
+    filename: str
+    mime_type: str
     pdf_base64: str
 
 
-def equipment_schema() -> dict[str, Any]:
-    properties = {
-        key: {
-            "type": "string",
-            "description": f"Value for {key}. Return '-' when the requested value is not visible or cannot be found."
-        }
-        for key in PARAMETER_KEYS
+# ============================================================
+# NORMALIZE VALUE
+# ============================================================
+
+def normalize_value(value: Any) -> str:
+    """
+    Convert missing / empty / null-like values to '-'.
+    Everything else is converted to string.
+    """
+
+    if value is None:
+        return "-"
+
+    text = str(value).strip()
+
+    if not text:
+        return "-"
+
+    null_values = {
+        "null",
+        "none",
+        "n/a",
+        "na",
+        "not available",
+        "not found",
+        "unknown",
+        "undefined",
     }
 
-    return {
-        "type": "object",
-        "properties": {
-            "equipment": {
-                "type": "array",
-                "description": "Every equipment item detected in the PDF drawing.",
-                "items": {
-                    "type": "object",
-                    "properties": properties,
-                    "required": PARAMETER_KEYS,
-                    "additionalProperties": False,
+    if text.lower() in null_values:
+        return "-"
+
+    return text
+
+
+# ============================================================
+# NORMALIZE EQUIPMENT
+# ============================================================
+
+def normalize_equipment(equipment: dict) -> dict:
+    """
+    Make sure every expected parameter exists.
+    Missing values become '-'.
+    """
+
+    result = {}
+
+    for key in PARAMETER_KEYS:
+        result[key] = normalize_value(equipment.get(key))
+
+    return result
+
+
+# ============================================================
+# GEMINI RESPONSE SCHEMA
+# ============================================================
+
+GEMINI_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "equipment": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "tag_no": {
+                        "type": "STRING"
+                    },
+                    "equipment_name": {
+                        "type": "STRING"
+                    },
+                    "type": {
+                        "type": "STRING"
+                    },
+
+                    "diameter": {
+                        "type": "STRING"
+                    },
+                    "diameter_od_id": {
+                        "type": "STRING"
+                    },
+                    "length": {
+                        "type": "STRING"
+                    },
+                    "length_remarks": {
+                        "type": "STRING"
+                    },
+                    "height": {
+                        "type": "STRING"
+                    },
+
+                    "insulation": {
+                        "type": "STRING"
+                    },
+                    "insulation_size": {
+                        "type": "STRING"
+                    },
+                    "insulation_type": {
+                        "type": "STRING"
+                    },
+
+                    "shell_pressure": {
+                        "type": "STRING"
+                    },
+                    "shell_min_temp": {
+                        "type": "STRING"
+                    },
+                    "shell_max_temp": {
+                        "type": "STRING"
+                    },
+
+                    "tube_pressure": {
+                        "type": "STRING"
+                    },
+                    "tube_min_temp": {
+                        "type": "STRING"
+                    },
+                    "tube_max_temp": {
+                        "type": "STRING"
+                    },
+
+                    "service_type": {
+                        "type": "STRING"
+                    },
+                    "service_description": {
+                        "type": "STRING"
+                    },
+
+                    "remarks": {
+                        "type": "STRING"
+                    },
                 },
-            }
-        },
-        "required": ["equipment"],
-        "additionalProperties": False,
-    }
+                "required": PARAMETER_KEYS,
+            },
+        }
+    },
+    "required": ["equipment"],
+}
 
+
+# ============================================================
+# EXTRACTION PROMPT
+# ============================================================
 
 EXTRACTION_PROMPT = """
-You are an engineering document extraction system.
+You are an engineering drawing data extraction AI.
 
-TASK
-Analyze the attached engineering PDF/P&ID and identify EVERY equipment item that is relevant
-to the equipment datasheet extraction task.
+Analyze the provided PDF engineering drawing carefully.
 
-The PDF may contain many valves, instruments, piping lines, fittings and symbols.
-DO NOT count those as equipment unless they are clearly an equipment item with an equipment
-tag/identification and equipment description.
+The PDF may contain ONE or MULTIPLE equipment items.
 
-IMPORTANT
-- One PDF can contain multiple equipment items.
-- Detect all equipment items in the document, not only the first one.
-- Use the equipment tag/header as the primary anchor.
-- Read the surrounding equipment data block and connected labels when they clearly belong
-  to that equipment.
-- Do not invent, estimate or infer engineering values.
-- Preserve the engineering value as shown in the source when possible.
-- If a requested parameter is not present, return "-".
-- If a field is not applicable to that equipment (for example tube-side data on a vessel),
-  return "-".
-- Do not convert units unless the source itself gives the converted value.
-- Do not use information from another equipment to fill a missing field.
-- For shell/tube equipment, keep shell-side and tube-side values separate.
-- For a vessel/drum, put its pressure/temperature under shell-side fields and tube-side
-  fields as "-".
-- "DUTY" or other source information that does not have a dedicated target field may be
-  retained in "remarks".
-- The requested target fields are based on the user's Excel template.
+Your task is to identify EVERY relevant equipment item shown in the drawing
+and extract the available engineering parameters.
 
-TARGET FIELDS
-1. tag_no
-2. equipment_name
-3. type
-4. diameter
-5. diameter_od_id
-6. length
-7. length_remarks
-8. height
-9. insulation
-10. insulation_size
-11. insulation_type
-12. shell_pressure
-13. shell_min_temp
-14. shell_max_temp
-15. tube_pressure
-16. tube_min_temp
-17. tube_max_temp
-18. service_type
-19. service_description
-20. remarks
+IMPORTANT RULES:
 
-OUTPUT
-Return JSON matching the supplied schema. Do not return commentary outside the JSON.
+1. Detect ALL equipment in the PDF.
+   Do not stop after finding the first equipment.
 
-QUALITY CHECK
-Before returning the result, verify that:
-- multiple equipment items were not merged into one;
-- instruments/valves were not incorrectly counted as equipment;
-- missing values are "-";
-- tag and equipment name belong to the same equipment;
-- shell and tube data are not mixed;
-- no engineering value was invented.
+2. Equipment means identifiable process/mechanical equipment such as:
+   - Vessel
+   - Separator
+   - Drum
+   - Tank
+   - Heat exchanger
+   - Cooler
+   - Heater
+   - Pump
+   - Compressor
+   - Column
+   - Reactor
+   - Other clearly identifiable major equipment.
+
+3. DO NOT count these as equipment:
+   - Valves
+   - Instruments
+   - Piping
+   - Fittings
+   - Flanges
+   - Reducers
+   - Elbows
+   - Small inline components
+   unless they are clearly identified as a major equipment item.
+
+4. Do NOT invent, estimate, calculate, or guess values.
+
+5. Only extract information that is actually visible or explicitly stated
+   in the PDF.
+
+6. If information is missing, unclear, or not applicable:
+   return "-"
+
+7. Preserve engineering values as written in the drawing whenever possible.
+
+8. Keep SHELL SIDE and TUBE SIDE information separate.
+
+9. For vessels, drums, tanks, separators, columns, etc.:
+   - Put vessel design pressure in shell_pressure.
+   - Put vessel design temperature in shell_min_temp or shell_max_temp
+     only when the drawing explicitly identifies the temperature.
+   - Do not invent a minimum temperature if only one design temperature exists.
+   - Tube-side fields should be "-".
+
+10. For heat exchangers/coolers:
+    - Keep shell-side and tube-side pressure/temperature separate.
+    - Do not mix the two sides.
+
+11. Diameter:
+    Extract the diameter exactly as shown.
+
+12. Diameter OD/ID:
+    If the drawing explicitly states OD or ID, record it.
+    Otherwise return "-".
+
+13. Length:
+    Extract vessel/equipment length where explicitly shown.
+
+14. Height:
+    Extract height where explicitly shown.
+
+15. Insulation:
+    If the drawing explicitly says NONE, return "No".
+    If insulation is explicitly indicated, return "Yes".
+    If not stated, return "-".
+
+16. Service:
+    Use the explicitly stated service/fluid information.
+    Do not guess the fluid based only on the equipment name.
+
+17. DUTY:
+    If a DUTY value is shown but there is no dedicated field,
+    preserve it in remarks.
+
+18. Tag number:
+    Extract the equipment tag exactly as shown.
+
+19. Equipment name:
+    Extract the equipment description/name exactly or very close to
+    the wording shown in the drawing.
+
+20. TYPE:
+    Identify the equipment type only when it is clear from the drawing.
+    Otherwise return "-".
+
+21. Return JSON only according to the requested schema.
+
+22. Every equipment object MUST contain every requested field.
+
+23. Use "-" for every unavailable field.
+
+Do not provide explanations outside the JSON.
 """
 
 
-def normalize_value(value: Any) -> str:
-    if value is None:
-        return "-"
-    value = str(value).strip()
-    if not value:
-        return "-"
-    if value.lower() in {"null", "none", "n/a", "na", "not found", "unknown"}:
-        return "-"
-    return value
+# ============================================================
+# ROOT
+# ============================================================
+
+@app.get("/")
+async def root():
+    return {
+        "service": "PDF Equipment Extractor",
+        "status": "ok",
+        "version": "0.1.0"
+    }
 
 
-def normalize_result(data: Any) -> dict[str, list[dict[str, str]]]:
-    if not isinstance(data, dict):
-        return {"equipment": []}
+# ============================================================
+# HEALTH
+# ============================================================
 
-    raw_items = data.get("equipment", [])
-    if not isinstance(raw_items, list):
-        raw_items = []
+@app.get("/health")
+async def health(request: Request):
+    env = request.scope.get("env")
 
-    normalized = []
-    for item in raw_items:
-        if not isinstance(item, dict):
-            continue
+    if env is None:
+        model = "unknown"
+    else:
+        model = getattr(
+            env,
+            "GEMINI_MODEL",
+            "gemini-3.5-flash-lite"
+        )
 
-        row = {key: normalize_value(item.get(key)) for key in PARAMETER_KEYS}
-
-        # A result without a tag and name is generally not a usable equipment record.
-        # We keep it only when at least one of the two is present.
-        if row["tag_no"] == "-" and row["equipment_name"] == "-":
-            continue
-
-        normalized.append(row)
-
-    return {"equipment": normalized}
+    return {
+        "status": "ok",
+        "model": model,
+        "pdf_direct_vision": True
+    }
 
 
-def parse_gemini_json(text: str) -> dict[str, Any]:
-    cleaned = (text or "").strip()
+# ============================================================
+# ANALYZE PDF
+# ============================================================
 
-    # Structured output should already be valid JSON. This fallback handles accidental
-    # markdown fences without weakening the extraction rules.
-    if cleaned.startswith("```"):
-        lines = cleaned.splitlines()
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        cleaned = "\n".join(lines).strip()
+@app.post("/api/analyze")
+async def analyze(
+    payload: AnalyzeRequest,
+    request: Request
+):
+    """
+    Receive PDF as Base64,
+    send directly to Gemini,
+    return structured equipment JSON.
+    """
 
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError as exc:
+    # --------------------------------------------------------
+    # GET CLOUDFLARE ENV
+    # --------------------------------------------------------
+
+    env = request.scope.get("env")
+
+    if env is None:
         raise HTTPException(
-            status_code=502,
-            detail=f"Gemini returned invalid JSON: {exc}",
-        ) from exc
+            status_code=500,
+            detail="Cloudflare environment is not available."
+        )
 
-
-async def call_gemini(pdf_bytes: bytes, mime_type: str, env: Any) -> dict[str, Any]:
     api_key = getattr(env, "GEMINI_API_KEY", None)
+
+    model = getattr(
+        env,
+        "GEMINI_MODEL",
+        "gemini-3.5-flash-lite"
+    )
+
     if not api_key:
         raise HTTPException(
             status_code=500,
-            detail="GEMINI_API_KEY is not configured in the Cloudflare Worker secret.",
+            detail="GEMINI_API_KEY is not configured."
         )
 
-    model = getattr(env, "GEMINI_MODEL", None) or DEFAULT_MODEL
+    # --------------------------------------------------------
+    # VALIDATE MIME TYPE
+    # --------------------------------------------------------
 
-    # Use the Workers runtime fetch API through the Python FFI.
-    from js import fetch  # type: ignore
+    if payload.mime_type.lower() != "application/pdf":
+        raise HTTPException(
+            status_code=400,
+            detail="Only application/pdf is supported."
+        )
+
+    # --------------------------------------------------------
+    # DECODE PDF
+    # --------------------------------------------------------
+
+    try:
+        pdf_bytes = base64.b64decode(
+            payload.pdf_base64,
+            validate=True
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid PDF Base64 data."
+        )
+
+    # --------------------------------------------------------
+    # SIZE CHECK
+    # --------------------------------------------------------
+
+    pdf_size = len(pdf_bytes)
+
+    if pdf_size == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="PDF file is empty."
+        )
+
+    if pdf_size > MAX_PDF_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail="PDF file is too large. Maximum size is 15 MB."
+        )
+
+    # --------------------------------------------------------
+    # PDF SIGNATURE CHECK
+    # --------------------------------------------------------
+
+    if not pdf_bytes.startswith(b"%PDF"):
+        raise HTTPException(
+            status_code=400,
+            detail="Uploaded file does not appear to be a valid PDF."
+        )
+
+    # --------------------------------------------------------
+    # GEMINI ENDPOINT
+    # --------------------------------------------------------
 
     endpoint = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{model}:generateContent?key={api_key}"
+        "https://generativelanguage.googleapis.com/"
+        "v1beta/models/"
+        f"{model}:generateContent"
+        f"?key={api_key}"
     )
+
+    # --------------------------------------------------------
+    # GEMINI REQUEST
+    # --------------------------------------------------------
 
     request_body = {
         "contents": [
             {
                 "role": "user",
                 "parts": [
-                    {"text": EXTRACTION_PROMPT},
+                    {
+                        "text": EXTRACTION_PROMPT
+                    },
                     {
                         "inline_data": {
-                            "mime_type": mime_type,
-                            "data": base64.b64encode(pdf_bytes).decode("ascii"),
+                            "mime_type": "application/pdf",
+                            "data": payload.pdf_base64
                         }
-                    },
-                ],
+                    }
+                ]
             }
         ],
         "generationConfig": {
             "temperature": 0,
             "responseMimeType": "application/json",
-            "responseSchema": equipment_schema(),
-        },
+            "responseSchema": GEMINI_SCHEMA
+        }
     }
 
-    response = await fetch(
-        endpoint,
-        {
-            "method": "POST",
-            "headers": {
-                "Content-Type": "application/json",
-            },
-            "body": json.dumps(request_body),
-        },
-    )
-
-    status = int(response.status)
-    response_text = await response.text()
-
-    if status < 200 or status >= 300:
-        # Avoid returning the API key. The Gemini response itself is safe to expose
-        # to the frontend as an error message, but trim it to keep UI errors manageable.
-        detail = response_text[:1200]
-        raise HTTPException(
-            status_code=502,
-            detail=f"Gemini API error ({status}): {detail}",
-        )
+    # --------------------------------------------------------
+    # CALL GEMINI
+    # --------------------------------------------------------
 
     try:
-        payload = json.loads(response_text)
-    except json.JSONDecodeError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail="Gemini API returned a non-JSON response.",
-        ) from exc
-
-    candidates = payload.get("candidates") or []
-    if not candidates:
-        raise HTTPException(
-            status_code=502,
-            detail="Gemini returned no candidates.",
+        response = await fetch(
+            endpoint,
+            {
+                "method": "POST",
+                "headers": {
+                    "Content-Type": "application/json"
+                },
+                "body": json.dumps(request_body)
+            }
         )
 
-    parts = candidates[0].get("content", {}).get("parts", [])
-    model_text = ""
-    for part in parts:
-        if isinstance(part, dict) and part.get("text"):
-            model_text += part["text"]
-
-    if not model_text:
+    except Exception as exc:
         raise HTTPException(
             status_code=502,
-            detail="Gemini returned no extraction text.",
+            detail=f"Failed to connect to Gemini: {str(exc)}"
         )
 
-    return parse_gemini_json(model_text)
-
-
-@app.get("/")
-async def root():
-    return {
-        "name": "PDF Equipment Extractor",
-        "version": "0.1.0",
-        "status": "ok",
-    }
-
-
-@app.get("/health")
-async def health():
-    return {
-        "status": "ok",
-        "model": DEFAULT_MODEL,
-        "pdf_direct_vision": True,
-    }
-
-
-@app.post("/api/analyze")
-async def analyze(payload: AnalyzeRequest, request: Any):
-    if payload.mime_type.lower() != "application/pdf":
-        raise HTTPException(status_code=415, detail="Only PDF files are supported.")
-
-    if not payload.pdf_base64:
-        raise HTTPException(status_code=400, detail="PDF data is missing.")
+    # --------------------------------------------------------
+    # READ GEMINI RESPONSE
+    # --------------------------------------------------------
 
     try:
-        pdf_bytes = base64.b64decode(payload.pdf_base64, validate=True)
-    except (binascii.Error, ValueError) as exc:
-        raise HTTPException(status_code=400, detail="Invalid base64 PDF data.") from exc
-
-    if not pdf_bytes.startswith(b"%PDF"):
-        raise HTTPException(status_code=400, detail="Uploaded data is not a valid PDF.")
-
-    if len(pdf_bytes) > MAX_PDF_BYTES:
+        response_text = await response.text()
+    except Exception as exc:
         raise HTTPException(
-            status_code=413,
-            detail=f"PDF exceeds the V1 limit of {MAX_PDF_BYTES // (1024 * 1024)} MB.",
+            status_code=502,
+            detail=f"Failed to read Gemini response: {str(exc)}"
         )
 
-    env = request.scope["env"]
+    # --------------------------------------------------------
+    # GEMINI HTTP ERROR
+    # --------------------------------------------------------
 
-    result = await call_gemini(pdf_bytes, payload.mime_type, env)
-    normalized = normalize_result(result)
+    if response.status < 200 or response.status >= 300:
+
+        try:
+            error_data = json.loads(response_text)
+
+            error_message = (
+                error_data
+                .get("error", {})
+                .get("message", response_text)
+            )
+
+        except Exception:
+            error_message = response_text
+
+        raise HTTPException(
+            status_code=502,
+            detail=f"Gemini API error: {error_message}"
+        )
+
+    # --------------------------------------------------------
+    # PARSE GEMINI RESPONSE
+    # --------------------------------------------------------
+
+    try:
+        gemini_data = json.loads(response_text)
+
+    except Exception:
+        raise HTTPException(
+            status_code=502,
+            detail="Gemini returned an invalid response."
+        )
+
+    # --------------------------------------------------------
+    # EXTRACT TEXT
+    # --------------------------------------------------------
+
+    try:
+        candidates = gemini_data.get("candidates", [])
+
+        if not candidates:
+            raise ValueError(
+                "Gemini returned no candidates."
+            )
+
+        content = candidates[0].get("content", {})
+
+        parts = content.get("parts", [])
+
+        if not parts:
+            raise ValueError(
+                "Gemini returned no content parts."
+            )
+
+        generated_text = parts[0].get("text", "")
+
+        if not generated_text:
+            raise ValueError(
+                "Gemini returned empty text."
+            )
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Unable to extract Gemini result: {str(exc)}"
+        )
+
+    # --------------------------------------------------------
+    # PARSE STRUCTURED JSON
+    # --------------------------------------------------------
+
+    try:
+        result = json.loads(generated_text)
+
+    except Exception:
+        raise HTTPException(
+            status_code=502,
+            detail="Gemini returned invalid JSON."
+        )
+
+    # --------------------------------------------------------
+    # VALIDATE EQUIPMENT ARRAY
+    # --------------------------------------------------------
+
+    equipment_list = result.get("equipment", [])
+
+    if not isinstance(equipment_list, list):
+        equipment_list = []
+
+    # --------------------------------------------------------
+    # NORMALIZE ALL EQUIPMENT
+    # --------------------------------------------------------
+
+    normalized_equipment = []
+
+    for item in equipment_list:
+
+        if not isinstance(item, dict):
+            continue
+
+        normalized_equipment.append(
+            normalize_equipment(item)
+        )
+
+    # --------------------------------------------------------
+    # FINAL RESPONSE
+    # --------------------------------------------------------
 
     return {
         "status": "ok",
         "filename": payload.filename,
-        "equipment_count": len(normalized["equipment"]),
-        "equipment": normalized["equipment"],
+        "equipment_count": len(normalized_equipment),
+        "equipment": normalized_equipment
     }
 
+
+# ============================================================
+# CLOUDFLARE PYTHON WORKER ENTRYPOINT
+# ============================================================
 
 Default = asgi.entrypoint(app)
