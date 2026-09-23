@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PDF Equipment Extractor</title>
+  <meta name="description" content="Extract equipment data from scanned engineering PDFs using AI.">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div>
+        <div class="eyebrow">ENGINEERING DOCUMENT AI</div>
+        <h1>PDF Equipment Extractor</h1>
+        <p>Scan a P&amp;ID PDF, detect equipment automatically, and extract parameters for your Excel template.</p>
+      </div>
+      <div class="status-pill"><span class="dot"></span> V1 • AI Extraction</div>
+    </header>
+
+    <main>
+      <section class="hero-card">
+        <div class="hero-copy">
+          <span class="step-label">STEP 1</span>
+          <h2>Upload one PDF</h2>
+          <p>
+            The system will detect how many equipment items are present in the drawing,
+            extract the available parameters, and use <strong>-</strong> when a requested
+            value is not found.
+          </p>
+        </div>
+
+        <label class="dropzone" id="dropzone">
+          <input id="pdfFile" type="file" accept="application/pdf,.pdf" hidden>
+          <div class="upload-icon">↑</div>
+          <strong id="dropTitle">Choose a PDF</strong>
+          <span id="dropSubtitle">or drag &amp; drop it here</span>
+          <small>PDF only • V1 recommended size ≤ 15 MB</small>
+        </label>
+
+        <div class="file-row hidden" id="fileRow">
+          <div class="file-icon">PDF</div>
+          <div class="file-info">
+            <strong id="fileName">-</strong>
+            <span id="fileSize">-</span>
+          </div>
+          <button class="ghost-btn" id="removeFile" type="button">Remove</button>
+        </div>
+
+        <button class="primary-btn" id="analyzeBtn" type="button" disabled>
+          Analyze PDF
+        </button>
+      </section>
+
+      <section class="progress-card hidden" id="progressCard">
+        <div class="progress-head">
+          <div>
+            <span class="step-label">PROCESSING</span>
+            <h3 id="progressTitle">Preparing PDF…</h3>
+          </div>
+          <span id="progressPercent">0%</span>
+        </div>
+        <div class="progress-track"><div id="progressBar"></div></div>
+        <div class="process-steps">
+          <span id="p1">01 Upload</span>
+          <span id="p2">02 Detect equipment</span>
+          <span id="p3">03 Extract parameters</span>
+          <span id="p4">04 Validate</span>
+        </div>
+      </section>
+
+      <section class="result-card hidden" id="resultCard">
+        <div class="result-head">
+          <div>
+            <span class="step-label">RESULT</span>
+            <h2><span id="equipmentCount">0</span> equipment detected</h2>
+            <p id="resultMessage">Review the extracted values before committing them to Excel.</p>
+          </div>
+          <button class="secondary-btn" id="copyJsonBtn" type="button">Copy JSON</button>
+        </div>
+
+        <div id="equipmentList" class="equipment-list"></div>
+
+        <div class="json-panel">
+          <button class="json-toggle" id="jsonToggle" type="button">
+            Show raw JSON <span>⌄</span>
+          </button>
+          <pre id="rawJson" class="hidden"></pre>
+        </div>
+      </section>
+
+      <section class="info-grid">
+        <article>
+          <span class="info-icon">1</span>
+          <h3>Detect</h3>
+          <p>Find equipment tags and descriptions in the engineering drawing instead of assuming one PDF equals one equipment.</p>
+        </article>
+        <article>
+          <span class="info-icon">2</span>
+          <h3>Extract</h3>
+          <p>Map the visible engineering information into the fields defined by the Excel template.</p>
+        </article>
+        <article>
+          <span class="info-icon">3</span>
+          <h3>Validate</h3>
+          <p>Missing values become <strong>-</strong>. The AI is instructed not to invent engineering values.</p>
+        </article>
+      </section>
+    </main>
+
+    <footer>
+      <span>PDF Equipment Extractor V1</span>
+      <span>Gemini • Cloudflare Workers • GitHub Pages</span>
+    </footer>
+  </div>
+
+  <div class="toast hidden" id="toast"></div>
+  <script src="script.js"></script>
+</body>
+</html>
