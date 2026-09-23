@@ -17,8 +17,8 @@ from pyodide.ffi import to_js
 
 app = FastAPI(
     title="PDF Equipment Extractor",
-    version="0.1.1",
-    description="Extract equipment data from engineering PDFs using Gemini.",
+    version="0.2.0",
+    description="Extract engineering equipment data from PDF drawings using Gemini.",
 )
 
 app.add_middleware(
@@ -87,6 +87,8 @@ def normalize_value(value: Any) -> str:
         "not found",
         "unknown",
         "undefined",
+        "not specified",
+        "not applicable",
     }:
         return "-"
 
@@ -94,10 +96,16 @@ def normalize_value(value: Any) -> str:
 
 
 def normalize_equipment(item: dict) -> dict:
-    return {
+    result = {
         key: normalize_value(item.get(key))
         for key in PARAMETER_KEYS
     }
+
+    # Never allow an accidental null-like value into the final response.
+    for key, value in result.items():
+        result[key] = normalize_value(value)
+
+    return result
 
 
 def get_env(request: Request) -> Any:
@@ -123,7 +131,7 @@ def get_binding(env: Any, name: str, default: Any = None) -> Any:
 
 
 # ============================================================
-# GEMINI SCHEMA
+# GEMINI STRUCTURED OUTPUT SCHEMA
 # ============================================================
 
 EQUIPMENT_PROPERTIES = {
@@ -166,98 +174,206 @@ GEMINI_SCHEMA = {
 
 
 # ============================================================
-# EXTRACTION PROMPT
+# EXTRACTION PROMPT V2
 # ============================================================
 
-EXTRACTION_PROMPT = """
-You are an engineering drawing data extraction AI.
+EXTRACTION_PROMPT = r"""
+You are a highly precise engineering drawing extraction system.
 
-Analyze the entire provided PDF engineering drawing.
+Your job is NOT to summarize the drawing. Your job is to extract equipment
+records and only the engineering data that is explicitly associated with
+those equipment records.
 
-The PDF may contain ONE or MULTIPLE equipment items.
-Identify EVERY relevant equipment item before returning the result.
+============================================================
+A. FIRST: BUILD AN EQUIPMENT INVENTORY
+============================================================
 
-EQUIPMENT RULES
-1. Include clearly identifiable major/process equipment:
-   vessels, separators, drums, tanks, heat exchangers, coolers,
-   heaters, pumps, compressors, columns, reactors, and similar equipment.
+Before filling any fields, inspect the ENTIRE PDF and identify every major
+piece of process/mechanical equipment that has a clear equipment tag or
+clear equipment identity.
 
-2. Do NOT count valves, instruments, piping, fittings, flanges,
-   reducers, elbows, or small inline components as equipment.
+Examples of equipment:
+- vessel
+- separator
+- drum
+- tank
+- heat exchanger
+- cooler
+- heater
+- pump
+- compressor
+- column
+- reactor
 
-3. Do not invent, estimate, calculate, or guess information.
+Do NOT count these as equipment:
+- valves
+- instruments
+- piping
+- pipe lines
+- fittings
+- flanges
+- reducers
+- elbows
+- control valves
+- small inline components
 
-4. Use only information actually visible or explicitly stated in the PDF.
+Each equipment must appear exactly once in the output.
 
-5. If a value is missing, unclear, or not applicable, return "-".
+============================================================
+B. MOST IMPORTANT: ASSOCIATE DATA WITH THE CORRECT EQUIPMENT
+============================================================
 
-6. Preserve engineering values and units as shown whenever possible.
+For each equipment, identify the LOCAL text block, callout, equipment data
+block, specification block, or label that belongs to that equipment.
 
-FIELD RULES
-7. tag_no:
-   Extract the equipment tag exactly as shown.
+A dedicated equipment data/specification block associated with an equipment
+tag is authoritative for that equipment.
 
-8. equipment_name:
-   Extract the equipment description/name from the drawing.
+If the drawing contains an equipment summary/table/block near the title or
+upper part of the sheet, use the values in that block when they are clearly
+associated with the equipment tag.
 
-9. type:
-   Identify the equipment type only when clearly supported by the drawing.
+DO NOT take a number merely because it is visually close on the page.
 
-10. diameter:
-    Extract explicitly shown diameter.
+DO NOT copy a value from another equipment.
 
-11. diameter_od_id:
-    Record OD or ID only when explicitly stated.
-    Otherwise "-".
+DO NOT use values from process piping, instrument bubbles, valve tags, or
+nearby equipment unless the drawing explicitly associates the value with the
+target equipment.
 
-12. length:
-    Extract explicitly shown equipment/vessel length.
+============================================================
+C. CRITICAL DIMENSION RULE
+============================================================
 
-13. length_remarks:
-    Preserve useful length notation such as T-T, T/T, etc.
+Equipment diameter is NOT the same thing as nearby pipe/line size.
 
-14. height:
-    Extract explicitly shown height.
+Examples:
+- A pipe labeled 2", 3", 4", 6", etc. is NOT an equipment diameter.
+- A vessel label such as 10'-0" Ø is an equipment diameter.
+- A vessel label such as 10'-0" Ø x 40'-6" T/T means:
+    diameter = 10'-0"
+    length = 40'-6"
+    length_remarks = T/T
 
-15. insulation:
-    If explicitly "NONE", return "No".
-    If insulation is explicitly indicated, return "Yes".
-    If not stated, return "-".
+Only put a diameter in the diameter field when the drawing explicitly gives
+an equipment/vessel diameter.
 
-16. insulation_size and insulation_type:
-    Extract only when explicitly shown.
+Never infer equipment diameter from connected pipe sizes.
 
-17. SHELL SIDE:
-    Keep shell_pressure, shell_min_temp, and shell_max_temp separate
-    from tube-side values.
+============================================================
+D. CRITICAL TAG RULE
+============================================================
 
-18. TUBE SIDE:
-    Keep tube_pressure, tube_min_temp, and tube_max_temp separate.
+Read the equipment tag from the equipment's own label/data block.
 
-19. For vessels, drums, separators, tanks, columns, etc.:
-    Put explicitly stated vessel design pressure in shell_pressure.
-    Put a stated design temperature in shell_min_temp or shell_max_temp
-    only according to what is actually stated.
-    Do not invent a minimum temperature.
-    Tube-side fields are "-".
+Do NOT substitute another nearby tag.
 
-20. For heat exchangers/coolers:
-    Do not mix shell-side and tube-side values.
+If the drawing has similar-looking tags, verify the tag against the
+associated equipment name and local data block before returning it.
 
-21. service_type:
-    Use L, V, G, or another value only when explicitly supported.
+============================================================
+E. PRESSURE AND TEMPERATURE RULE
+============================================================
 
-22. service_description:
-    Extract explicitly stated service/fluid description.
-    Do not guess from the equipment name.
+Keep SHELL SIDE and TUBE SIDE completely separate.
 
-23. DUTY:
-    If DUTY is shown but there is no dedicated field,
-    preserve the DUTY information in remarks.
+For a heat exchanger/cooler:
+- shell_pressure = explicitly stated shell design pressure
+- shell_min_temp = explicitly stated shell minimum temperature, if stated
+- shell_max_temp = explicitly stated shell maximum/design temperature, if
+  the drawing clearly identifies it as maximum/design temperature
+- tube_pressure = explicitly stated tube design pressure
+- tube_min_temp = explicitly stated tube minimum temperature, if stated
+- tube_max_temp = explicitly stated tube maximum/design temperature, if
+  the drawing clearly identifies it as maximum/design temperature
 
-24. Every equipment object must contain every requested field.
+If the drawing only says "DESIGN TEMP" with one value and does not identify
+minimum or maximum, DO NOT invent a minimum/maximum classification.
+Put the exact design-temperature statement in remarks and use "-" for both
+min/max fields unless the drawing explicitly identifies which one it is.
 
-25. Return JSON only according to the supplied schema.
+For vessels, drums, separators, tanks, columns, etc.:
+- use the explicitly stated vessel design pressure in shell_pressure
+- use temperature fields only when their min/max meaning is explicitly
+  supported
+- tube-side fields are "-" unless the drawing explicitly provides a tube
+  side
+
+Never mix shell and tube values.
+
+============================================================
+F. INSULATION RULE
+============================================================
+
+If the equipment data explicitly says:
+- NONE -> insulation = "No"
+- insulation is provided -> insulation = "Yes"
+
+Only extract insulation size/type when explicitly stated.
+
+============================================================
+G. DUTY RULE
+============================================================
+
+If DUTY is explicitly shown but there is no dedicated DUTY field, preserve
+it in remarks.
+
+Do not convert or calculate duty.
+
+============================================================
+H. EXACT VALUE RULE
+============================================================
+
+Preserve the engineering value and units as shown whenever possible.
+
+Do not calculate conversions.
+Do not normalize feet/inches into meters.
+Do not change PSIG into kg/cm2 unless both are explicitly shown.
+Do not calculate missing dimensions.
+
+============================================================
+I. MISSING DATA RULE
+============================================================
+
+If a field is not explicitly available for that equipment, return "-".
+
+Never use:
+- null
+- none
+- unknown
+- N/A
+- not found
+
+Use "-" instead.
+
+============================================================
+J. SERVICE RULE
+============================================================
+
+service_type and service_description must come only from explicit drawing
+information.
+
+Do not guess a service or fluid from an equipment name.
+
+============================================================
+K. SELF-CHECK BEFORE RETURNING JSON
+============================================================
+
+Before returning the JSON, silently perform these checks:
+
+1. Did I identify every major equipment?
+2. Does every equipment tag belong to the equipment name beside it?
+3. Did I accidentally use a pipe size as an equipment diameter?
+4. Did I accidentally use a nearby equipment's dimension?
+5. Did I mix shell-side and tube-side pressure/temperature?
+6. Did I invent any missing value?
+7. Are all unavailable fields exactly "-"?
+8. If a dedicated equipment data block exists, did I prioritize it over
+   unrelated graphical values elsewhere on the P&ID?
+
+If any answer is uncertain, return "-" rather than guessing.
+
+Return JSON only according to the supplied schema.
 """
 
 
@@ -270,7 +386,7 @@ async def root():
     return {
         "service": "PDF Equipment Extractor",
         "status": "ok",
-        "version": "0.1.1",
+        "version": "0.2.0",
     }
 
 
@@ -283,15 +399,12 @@ async def health(request: Request):
         "status": "ok",
         "model": str(model),
         "pdf_direct_vision": True,
+        "extractor_version": "0.2.0",
     }
 
 
 @app.post("/api/analyze")
 async def analyze(payload: AnalyzeRequest, request: Request):
-    # --------------------------------------------------------
-    # ENV / SECRET
-    # --------------------------------------------------------
-
     env = get_env(request)
 
     api_key = get_binding(env, "GEMINI_API_KEY")
@@ -303,10 +416,7 @@ async def analyze(payload: AnalyzeRequest, request: Request):
             detail="GEMINI_API_KEY is not configured.",
         )
 
-    model = str(model).strip()
-
-    if not model:
-        model = "gemini-3.5-flash-lite"
+    model = str(model).strip() or "gemini-3.5-flash-lite"
 
     # --------------------------------------------------------
     # INPUT VALIDATION
@@ -348,7 +458,7 @@ async def analyze(payload: AnalyzeRequest, request: Request):
         )
 
     # --------------------------------------------------------
-    # GEMINI REQUEST
+    # GEMINI REST REQUEST
     # --------------------------------------------------------
 
     endpoint = (
@@ -379,8 +489,6 @@ async def analyze(payload: AnalyzeRequest, request: Request):
         },
     }
 
-    # Cloudflare Python Workers uses Pyodide FFI for JavaScript APIs.
-    # Explicitly convert the Python options object to a JS object.
     fetch_options = to_js(
         {
             "method": "POST",
@@ -404,10 +512,6 @@ async def analyze(payload: AnalyzeRequest, request: Request):
             detail=f"Gemini connection failed: {exc}",
         )
 
-    # --------------------------------------------------------
-    # READ RESPONSE
-    # --------------------------------------------------------
-
     try:
         status_code = int(response.status)
     except Exception as exc:
@@ -427,11 +531,9 @@ async def analyze(payload: AnalyzeRequest, request: Request):
     if status_code < 200 or status_code >= 300:
         try:
             error_data = json.loads(response_text)
-            error_message = (
-                error_data.get("error", {}).get(
-                    "message",
-                    response_text,
-                )
+            error_message = error_data.get("error", {}).get(
+                "message",
+                response_text,
             )
         except Exception:
             error_message = response_text
@@ -442,7 +544,7 @@ async def analyze(payload: AnalyzeRequest, request: Request):
         )
 
     # --------------------------------------------------------
-    # PARSE GEMINI JSON
+    # PARSE GEMINI RESPONSE
     # --------------------------------------------------------
 
     try:
@@ -455,16 +557,10 @@ async def analyze(payload: AnalyzeRequest, request: Request):
 
     try:
         candidates = gemini_data.get("candidates") or []
-
         if not candidates:
             raise ValueError("No candidates returned.")
 
-        parts = (
-            candidates[0]
-            .get("content", {})
-            .get("parts", [])
-        )
-
+        parts = candidates[0].get("content", {}).get("parts", [])
         generated_text = ""
 
         for part in parts:
@@ -510,6 +606,7 @@ async def analyze(payload: AnalyzeRequest, request: Request):
     return {
         "status": "ok",
         "filename": payload.filename,
+        "extractor_version": "0.2.0",
         "equipment_count": len(equipment),
         "equipment": equipment,
     }
