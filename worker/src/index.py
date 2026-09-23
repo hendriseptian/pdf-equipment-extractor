@@ -5,12 +5,12 @@ from typing import Any
 import base64
 import json
 
-from workers import asgi
+from workers import WorkerEntrypoint, Response, asgi
 from js import fetch
 
 app = FastAPI(
     title="PDF Equipment Extractor",
-    version="0.4.0",
+    version="0.5.0",
     description="Extract equipment data from engineering PDF drawings using Gemini."
 )
 
@@ -335,7 +335,7 @@ async def root():
     return {
         "service": "PDF Equipment Extractor",
         "status": "ok",
-        "version": "0.4.0",
+        "version": "0.5.0",
     }
 
 @app.get("/health")
@@ -346,7 +346,7 @@ async def health(request: Request):
         "status": "ok",
         "model": model,
         "pdf_direct_vision": True,
-        "extractor_version": "0.4.0",
+        "extractor_version": "0.5.0",
     }
 
 @app.post("/api/analyze")
@@ -458,4 +458,58 @@ async def analyze(payload: AnalyzeRequest, request: Request):
         "equipment": normalized,
     }
 
-Default = asgi.entrypoint(app)
+class Default(WorkerEntrypoint):
+    """
+    Explicit Worker-level fetch wrapper.
+
+    CORS is applied outside the ASGI/FastAPI layer so that browser
+    preflight and every response (including ASGI errors) receive the
+    required headers.
+    """
+
+    async def fetch(self, request):
+        cors_headers = {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization",
+            "Access-Control-Max-Age": "86400",
+        }
+
+        # Handle browser CORS preflight before entering FastAPI.
+        if request.method == "OPTIONS":
+            return Response("", status=204, headers=cors_headers)
+
+        try:
+            response = await asgi.fetch(app, request, self.env)
+
+            # Rebuild the response so CORS headers are guaranteed at the
+            # actual Worker response boundary.
+            response_headers = {
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                "Access-Control-Max-Age": "86400",
+            }
+
+            content_type = response.headers.get("content-type")
+            if content_type:
+                response_headers["Content-Type"] = content_type
+
+            return Response(
+                response.body,
+                status=response.status,
+                headers=response_headers,
+            )
+
+        except Exception as exc:
+            return Response(
+                json.dumps({
+                    "detail": "Worker internal error.",
+                    "error": str(exc),
+                }),
+                status=500,
+                headers={
+                    **cors_headers,
+                    "Content-Type": "application/json",
+                },
+            )
