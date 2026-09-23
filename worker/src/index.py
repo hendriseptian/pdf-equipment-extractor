@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 from typing import Any
 import base64
@@ -10,17 +10,34 @@ from js import fetch
 
 app = FastAPI(
     title="PDF Equipment Extractor",
-    version="0.3.0",
+    version="0.4.0",
     description="Extract equipment data from engineering PDF drawings using Gemini."
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+@app.middleware("http")
+async def cors_middleware(request: Request, call_next):
+    # Explicit CORS handling so browser requests always receive the
+    # Access-Control-Allow-Origin header, including error responses.
+    if request.method == "OPTIONS":
+        response = Response(status_code=204)
+    else:
+        try:
+            response = await call_next(request)
+        except Exception as exc:
+            response = JSONResponse(
+                status_code=500,
+                content={
+                    "detail": "Worker internal error.",
+                    "error": str(exc),
+                },
+            )
+
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    response.headers["Access-Control-Max-Age"] = "86400"
+
+    return response
 
 MAX_PDF_SIZE = 15 * 1024 * 1024
 
@@ -318,7 +335,7 @@ async def root():
     return {
         "service": "PDF Equipment Extractor",
         "status": "ok",
-        "version": "0.3.0",
+        "version": "0.4.0",
     }
 
 @app.get("/health")
@@ -329,7 +346,7 @@ async def health(request: Request):
         "status": "ok",
         "model": model,
         "pdf_direct_vision": True,
-        "extractor_version": "0.3.0",
+        "extractor_version": "0.4.0",
     }
 
 @app.post("/api/analyze")
