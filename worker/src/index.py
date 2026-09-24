@@ -170,94 +170,162 @@ GEMINI_SCHEMA = {
 # ============================================================
 
 EXTRACTION_PROMPT = """
-You are an engineering drawing data extraction AI.
+You are a STRICT engineering P&ID extraction engine.
 
-Analyze the entire provided PDF engineering drawing.
+Analyze the ENTIRE supplied PDF and identify every MAJOR EQUIPMENT item,
+then extract ONLY values visibly and explicitly associated with each exact
+equipment item.
 
-The PDF may contain ONE or MULTIPLE equipment items.
-Identify EVERY relevant equipment item before returning the result.
+This is a P&ID. It contains many pipe sizes, nozzle sizes, line numbers,
+valve tags, instrument tags, elevations, dimensions, and other numbers.
+Those values are NOT automatically equipment parameters.
 
-EQUIPMENT RULES
-1. Include clearly identifiable major/process equipment:
-   vessels, separators, drums, tanks, heat exchangers, coolers,
-   heaters, pumps, compressors, columns, reactors, and similar equipment.
+============================================================
+EQUIPMENT IDENTIFICATION
+============================================================
 
-2. Do NOT count valves, instruments, piping, fittings, flanges,
-   reducers, elbows, or small inline components as equipment.
+Include major/process equipment such as:
+coolers, heat exchangers, separators, drums, vessels, tanks, columns,
+pumps, compressors, heaters, reactors, and similar equipment.
 
-3. Do not invent, estimate, calculate, or guess information.
+Do NOT create equipment records for:
+valves, instruments, piping, fittings, flanges, reducers, elbows,
+nozzles by themselves, pipe sizes, or line numbers.
 
-4. Use only information actually visible or explicitly stated in the PDF.
+The equipment TAG must be copied CHARACTER-FOR-CHARACTER from the drawing.
+Never reinterpret or invent a tag.
 
-5. If a value is missing, unclear, or not applicable, return "-".
+============================================================
+EQUIPMENT DATA ASSOCIATION
+============================================================
 
-6. Preserve engineering values and units as shown whenever possible.
+For each equipment item, locate the data block/table/text that is
+VISUALLY ASSOCIATED with that exact equipment.
 
-FIELD RULES
-7. tag_no:
-   Extract the equipment tag exactly as shown.
+A value is valid only if the drawing clearly associates it with that
+equipment.
 
-8. equipment_name:
-   Extract the equipment description/name from the drawing.
+Do NOT copy a value merely because it is nearby, connected by piping,
+belongs to a nozzle, belongs to another equipment item, or appears elsewhere.
 
-9. type:
-   Identify the equipment type only when clearly supported by the drawing.
+If association is uncertain, return "-".
 
-10. diameter:
-    Extract explicitly shown diameter.
+============================================================
+DIMENSIONS
+============================================================
 
-11. diameter_od_id:
-    Record OD or ID only when explicitly stated.
-    Otherwise "-".
+DIAMETER:
+Extract only the equipment's own explicitly shown diameter.
 
-12. length:
-    Extract explicitly shown equipment/vessel length.
+Examples:
+10'-0" Ø
+10'-0" DIA
+10'-0" DIAMETER
 
-13. length_remarks:
-    Preserve useful length notation such as T-T, T/T, etc.
+NEVER use pipe/nozzle sizes such as 2", 3", 4", 6", 8", 12" as equipment
+diameter unless the drawing explicitly identifies that value as the
+equipment diameter.
 
-14. height:
-    Extract explicitly shown height.
+LENGTH:
+Extract only the equipment/vessel length explicitly shown for that equipment.
 
-15. insulation:
-    If explicitly "NONE", return "No".
-    If insulation is explicitly indicated, return "Yes".
-    If not stated, return "-".
+For:
+10'-0" Ø × 9'-0" T-T
+use diameter = 10'-0"
+length = 9'-0"
+length_remarks = T-T
 
-16. insulation_size and insulation_type:
-    Extract only when explicitly shown.
+For:
+10'-0" Ø × 40'-6" T/T
+use diameter = 10'-0"
+length = 40'-6"
+length_remarks = T/T
 
-17. SHELL SIDE:
-    Keep shell_pressure, shell_min_temp, and shell_max_temp separate
-    from tube-side values.
+Do not use pipe dimensions, elevations, nozzle dimensions, or unrelated
+drawing dimensions as equipment length.
 
-18. TUBE SIDE:
-    Keep tube_pressure, tube_min_temp, and tube_max_temp separate.
+HEIGHT:
+Populate only when an explicit equipment height is shown.
+Do not substitute an elevation or piping dimension.
 
-19. For vessels, drums, separators, tanks, columns, etc.:
-    Put explicitly stated vessel design pressure in shell_pressure.
-    Put a stated design temperature in shell_min_temp or shell_max_temp
-    only according to what is actually stated.
-    Do not invent a minimum temperature.
-    Tube-side fields are "-".
+============================================================
+PRESSURE AND TEMPERATURE
+============================================================
 
-20. For heat exchangers/coolers:
-    Do not mix shell-side and tube-side values.
+Use ONLY design pressure and temperature explicitly belonging to the exact
+equipment.
 
-21. service_type:
-    Use L, V, G, or another value only when explicitly supported.
+NEVER copy pressure or temperature from:
+- connected piping
+- valve/flange ratings
+- nozzle data
+- another equipment item
 
-22. service_description:
-    Extract explicitly stated service/fluid description.
-    Do not guess from the equipment name.
+For vessels, separators and drums:
+put explicitly stated vessel design pressure in shell_pressure.
+Tube-side fields are "-".
 
-23. DUTY:
-    If DUTY is shown but there is no dedicated field,
-    preserve the DUTY information in remarks.
+For coolers/heat exchangers:
+keep shell-side and tube-side pressure and temperature completely separate.
 
-24. Every equipment object must contain every requested field.
+If one design temperature is shown without min/max distinction, do not invent
+a minimum temperature.
 
-25. Return JSON only according to the supplied schema.
+============================================================
+INSULATION
+============================================================
+
+If the equipment's own data explicitly says NONE:
+insulation = "No"
+
+If insulation is explicitly indicated:
+insulation = "Yes"
+
+Otherwise:
+insulation = "-"
+
+============================================================
+SERVICE
+============================================================
+
+Use service_type only when explicitly supported by the drawing.
+Use service_description only when explicitly stated.
+Do not infer service/fluid from the equipment name.
+
+============================================================
+DUTY
+============================================================
+
+If DUTY is explicitly shown and there is no dedicated field, preserve it in
+remarks.
+
+============================================================
+MISSING / UNCERTAIN VALUES
+============================================================
+
+If a value is missing, unclear, unreadable, ambiguous, not applicable, or
+not explicitly associated with the equipment, return exactly "-".
+
+NEVER estimate.
+NEVER calculate.
+NEVER guess.
+
+============================================================
+FINAL SELF-CHECK
+============================================================
+
+Before returning each equipment object verify:
+
+1. Tag exactly matches the drawing.
+2. Name belongs to that exact tag.
+3. Diameter is equipment diameter, not pipe/nozzle size.
+4. Length is equipment length.
+5. Pressure belongs to that exact equipment.
+6. Temperature belongs to that exact equipment.
+7. Values were not copied from another equipment item.
+8. Any uncertain field is "-".
+
+Return JSON ONLY according to the supplied schema.
 """
 
 
@@ -283,7 +351,7 @@ async def health(request: Request):
         "status": "ok",
         "model": str(model),
         "pdf_direct_vision": True,
-        "extractor_version": "0.6.0",
+        "extractor_version": "0.7.0",
     }
 
 
