@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P&ID Piping Tag Extractor</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header><div class="eyebrow">ENGINEERING AI TOOL</div><h1>P&ID Piping Tag Extractor</h1><p>Scan a P&ID PDF and extract piping / line tags into your Excel template.</p></header>
+<main>
+<section class="card">
+<h2>1. Upload P&ID PDF</h2>
+<p class="muted">The PDF is rendered into high-resolution overlapping visual tiles before AI analysis.</p>
+<input id="pdfInput" type="file" accept="application/pdf">
+<button id="analyzeBtn" disabled>Analyze Piping Tags</button>
+<button id="clearBtn" class="secondary">Clear</button>
+<div id="status" class="status">No PDF selected.</div>
+</section>
+<section class="card" id="resultCard" hidden>
+<div class="resultHead"><div><div class="eyebrow">PIPING TAG RESULT</div><h2 id="resultTitle">0 tags</h2></div><button id="downloadBtn">Download Excel</button></div>
+<div class="meta" id="meta"></div>
+<div class="tableWrap"><table><thead><tr><th>No.</th><th>Tag No.</th><th>P&ID No.</th><th>From</th><th>To</th><th>Size (NPS in)</th></tr></thead><tbody id="tbody"></tbody></table></div>
+<p class="muted">From / To are intentionally left blank as requested. You can edit the table before exporting.</p>
+</section>
+</main>
+<footer>Online Engineering AI Tool</footer>
+<script src="https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js"></script>
+<script type="module" src="script.js"></script>
+</body></html>

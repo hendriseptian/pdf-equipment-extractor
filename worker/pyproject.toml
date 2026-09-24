@@ -1,0 +1,9 @@
+[project]
+name = "piping-tag-extractor"
+version = "1.0.0"
+description = "P&ID piping tag extractor using Gemini vision"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "pydantic>=2,<3",
+]
