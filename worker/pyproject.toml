@@ -1,6 +1,6 @@
 [project]
 name = "pdf-equipment-extractor"
-version = "0.1.0"
+version = "1.0.0"
 description = "Online engineering PDF equipment extractor using FastAPI on Cloudflare Python Workers and Gemini."
 requires-python = ">=3.13"
 dependencies = [
