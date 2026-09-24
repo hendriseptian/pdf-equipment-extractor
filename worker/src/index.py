@@ -17,7 +17,7 @@ from pyodide.ffi import to_js
 # APP
 # ============================================================
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 PRIMARY_MODEL_DEFAULT = "gemini-3.8-flash"
 FALLBACK_MODEL_DEFAULT = "gemini-3.7-flash"
 LAST_RESORT_MODEL_DEFAULT = "gemini-3.5-flash-lite"
@@ -453,6 +453,135 @@ Return JSON ONLY according to the supplied schema.
 """
 
 
+
+# ============================================================
+# DIRECT EXTRACTION RECOVERY PROMPT
+# ============================================================
+
+DIRECT_EXTRACTION_PROMPT = r"""
+You are the PRIMARY VISUAL ENGINEERING P&ID EXTRACTION ENGINE.
+
+IMPORTANT: Do NOT perform a separate discovery step. Inspect the supplied
+PDF yourself and directly identify the real major process equipment AND its
+parameters in one visual pass.
+
+The PDF page is the only source of truth.
+
+============================================================
+EQUIPMENT SCOPE
+============================================================
+
+Find physical major/process equipment that is actually shown on this sheet:
+- heat exchangers / coolers
+- separators / drums / vessels
+- columns
+- tanks
+- pumps / compressors
+- heaters / furnaces / reactors
+- other clearly identifiable major process equipment
+
+DO NOT count:
+- valves
+- instruments
+- piping or line numbers
+- fittings / flanges
+- individual nozzles
+- pipe supports
+- elevations
+- isolated dimensions
+- equipment merely referenced by text when its physical body/data is not
+  actually present on this sheet
+
+A valid equipment record normally has a visible equipment body/symbol and/or
+an equipment data block, with a tag or explicit equipment title associated
+with it. The tag may be above, below, beside, or inside the equipment area.
+
+Do not invent tags. Copy visible tag text exactly.
+
+============================================================
+VISUAL ASSOCIATION RULE
+============================================================
+
+Every parameter MUST belong to the same equipment as the tag.
+
+NEVER use:
+- pipe size as equipment diameter
+- nozzle size as equipment diameter
+- valve rating as equipment pressure
+- piping pressure as equipment design pressure
+- elevation as equipment height
+- dimensions belonging to another equipment
+- values from a neighboring equipment data block
+
+If you cannot visually prove the association, return "-".
+
+============================================================
+DIMENSIONS
+============================================================
+
+For vessels/drums/separators/exchangers, use only dimensions explicitly
+associated with that equipment.
+
+Example:
+10'-0" Ø × 9'-0" T-T
+=> diameter = 10'-0"
+=> length = 9'-0"
+=> length_remarks = T-T
+
+Example:
+10'-0" Ø × 40'-6" T/T
+=> diameter = 10'-0"
+=> length = 40'-6"
+=> length_remarks = T/T
+
+Never use a nearby pipe/nozzle dimension as diameter or length.
+
+============================================================
+PRESSURE / TEMPERATURE
+============================================================
+
+Use only explicitly labelled equipment design values.
+
+For vessels, drums and separators:
+- design pressure -> shell_pressure
+- design temperature -> shell_max_temp ONLY when it is explicitly a design
+  temperature and there is no min/max ambiguity
+- tube fields -> "-"
+
+For exchangers/coolers:
+- keep shell and tube sides separate
+- do not swap shell and tube values
+
+If a value is ambiguous, use "-".
+
+============================================================
+OTHER DATA
+============================================================
+
+Insulation: use only explicit information such as NONE.
+Service: use only explicit information; do not infer fluid from equipment name.
+Duty: if explicitly shown but there is no dedicated field, put it in remarks.
+
+============================================================
+ANTI-HALLUCINATION
+============================================================
+
+Never calculate, estimate, infer, convert, or borrow values.
+Missing/unreadable/ambiguous values MUST be "-".
+
+Before returning, perform a visual cross-check for every record:
+1. tag belongs to the physical equipment;
+2. name belongs to that tag;
+3. dimensions belong to that equipment;
+4. pressure belongs to that equipment;
+5. temperature belongs to that equipment;
+6. shell/tube are not mixed;
+7. no nearby piping/nozzle values were copied;
+8. only equipment physically represented on this sheet is included.
+
+Return JSON ONLY using the supplied schema.
+"""
+
 # ============================================================
 # GEMINI CALL HELPERS
 # ============================================================
@@ -657,7 +786,7 @@ async def root():
         "service": "PDF Equipment Extractor",
         "status": "ok",
         "version": APP_VERSION,
-        "pipeline": "discovery + extraction-verification",
+        "pipeline": "discovery + recovery + direct-extraction + verification",
     }
 
 
@@ -680,7 +809,7 @@ async def health(request: Request):
         "pdf_direct_vision": True,
         "media_resolution": "high",
         "thinking_level": "high",
-        "pipeline": "multi-model discovery + recovery + extraction-verification",
+        "pipeline": "discovery + recovery + direct-extraction + verification",
         "extractor_version": APP_VERSION,
     }
 
@@ -833,18 +962,58 @@ async def analyze(payload: AnalyzeRequest, request: Request):
             if recovery_error.status_code not in {502, 503}:
                 raise
 
-    # No equipment after both visual discovery passes: return evidence rather
-    # than inventing an equipment record.
-    # discovery stage rather than inventing an equipment record.
+    # --------------------------------------------------------
+    # DIRECT EXTRACTION RECOVERY
+    # --------------------------------------------------------
+    # A discovery-only architecture can fail even when the vision model can
+    # actually read the PDF. If both inventory passes return zero, do NOT stop.
+    # Ask the model to perform direct full extraction from the PDF.
+    direct_recovery_used = False
+    direct_recovery_model = None
+    direct_equipment = []
+
+    if not discovered_clean:
+        direct_recovery_used = True
+        direct_data, direct_recovery_model = await gemini_with_fallbacks(
+            api_key,
+            model_chain,
+            payload.pdf_base64,
+            DIRECT_EXTRACTION_PROMPT,
+            EQUIPMENT_SCHEMA,
+        )
+        direct_equipment = normalize_equipment_list(
+            direct_data.get("equipment", [])
+        )
+
+        # Use directly extracted records as the controlled checklist for the
+        # verification pass. This avoids returning a false zero.
+        for item in direct_equipment:
+            if item.get("tag_no") == "-":
+                continue
+            key = item["tag_no"].upper().replace(" ", "")
+            if key in seen:
+                continue
+            seen.add(key)
+            discovered_clean.append({
+                "tag_no": item["tag_no"],
+                "equipment_name": item["equipment_name"],
+                "type": item["type"],
+            })
+
+    # If every recovery attempt genuinely found nothing, return a diagnostic
+    # result. This is now a last resort rather than the normal path.
     if not discovered_clean:
         return {
             "status": "ok",
             "filename": payload.filename,
             "equipment_count": 0,
             "equipment": [],
-            "pipeline": "multi-model discovery + recovery + extraction-verification",
-            "model_used": discovery_model,
+            "pipeline": "discovery + recovery + direct-extraction + verification",
+            "model_used": direct_recovery_model or discovery_model,
+            "discovery_model": discovery_model,
+            "direct_recovery_used": direct_recovery_used,
             "verification": "not_run",
+            "diagnostic": "No physical major equipment was identified after discovery, recovery, and direct visual extraction passes.",
         }
 
     # --------------------------------------------------------
@@ -907,9 +1076,11 @@ async def analyze(payload: AnalyzeRequest, request: Request):
         "filename": payload.filename,
         "equipment_count": len(ordered),
         "equipment": ordered,
-        "pipeline": "multi-model discovery + recovery + extraction-verification",
+        "pipeline": "discovery + recovery + direct-extraction + verification",
         "model_used": extraction_model,
         "discovery_model": discovery_model,
+        "direct_recovery_used": direct_recovery_used,
+        "direct_recovery_model": direct_recovery_model,
         "verification": "completed",
     }
 
