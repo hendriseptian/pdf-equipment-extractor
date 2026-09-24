@@ -18,3 +18,6 @@ Variables are in `worker/wrangler.jsonc`.
 ## Deploy
 Use the same Cloudflare Python Workers deployment method already working in the existing project:
 `uv run pywrangler deploy`
+
+
+Deployment note: this project uses Cloudflare Pywrangler via the `workers-py` dev dependency. Deploy with `uv run pywrangler deploy`.
