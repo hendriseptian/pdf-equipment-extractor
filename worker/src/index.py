@@ -17,9 +17,10 @@ from pyodide.ffi import to_js
 # APP
 # ============================================================
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 PRIMARY_MODEL_DEFAULT = "gemini-3.8-flash"
 FALLBACK_MODEL_DEFAULT = "gemini-3.7-flash"
+LAST_RESORT_MODEL_DEFAULT = "gemini-3.5-flash-lite"
 MAX_PDF_SIZE = 15 * 1024 * 1024
 MAX_EQUIPMENT = 30
 
@@ -460,6 +461,24 @@ RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
 RETRY_DELAYS = [2.0, 5.0]
 
 
+def model_is_gemini_3(model: str) -> bool:
+    return model.startswith("gemini-3.")
+
+
+def model_config(model: str, high_quality: bool = True) -> dict:
+    cfg = {
+        "responseMimeType": "application/json",
+    }
+    # Thinking-level is supported by Gemini 3.x. The older 3.5 Flash-Lite
+    # fallback must not receive unsupported Gemini 3 thinking parameters.
+    if model_is_gemini_3(model):
+        cfg["thinkingConfig"] = {"thinkingLevel": "high" if high_quality else "low"}
+        cfg["media_resolution"] = "MEDIA_RESOLUTION_HIGH" if high_quality else "MEDIA_RESOLUTION_MEDIUM"
+    else:
+        cfg["media_resolution"] = "MEDIA_RESOLUTION_HIGH" if high_quality else "MEDIA_RESOLUTION_MEDIUM"
+    return cfg
+
+
 async def sleep_retry(seconds: float) -> None:
     await asyncio.sleep(seconds + random.uniform(0.0, 0.75))
 
@@ -503,14 +522,8 @@ async def gemini_request(
             }
         ],
         "generationConfig": {
-            "responseMimeType": "application/json",
+            **model_config(model, high_quality=True),
             "responseSchema": schema,
-            "thinkingConfig": {
-                "thinkingLevel": "high",
-            },
-            # P&IDs are dense engineering diagrams. High resolution gives
-            # Gemini more visual detail than the previous V9 medium setting.
-            "media_resolution": "MEDIA_RESOLUTION_HIGH",
         },
     }
 
@@ -563,6 +576,40 @@ async def gemini_request(
         ),
         headers={"X-Gemini-Model": model},
     )
+
+
+async def gemini_with_fallbacks(
+    api_key: str,
+    models: list[str],
+    pdf_base64: str,
+    prompt: str,
+    schema: dict,
+) -> tuple[dict, str]:
+    """Try models in order. Each model gets bounded retry on transient errors.
+
+    Primary remains Gemini 3.8 Flash. The fallbacks exist for temporary 503
+    capacity spikes so a free-tier capacity event does not break the workflow.
+    """
+    last_error = None
+    for index, model in enumerate(models):
+        if not model:
+            continue
+        try:
+            data, _ = await gemini_request(
+                api_key, model, pdf_base64, prompt, schema
+            )
+            return data, model
+        except HTTPException as exc:
+            last_error = exc
+            # Only capacity/server errors should move to another model.
+            if exc.status_code not in {408, 429, 500, 502, 503, 504}:
+                raise
+            # Continue to the next model.
+            continue
+
+    if last_error is not None:
+        raise last_error
+    raise HTTPException(status_code=503, detail="No Gemini model is configured.")
 
 
 def parse_generated_json(gemini_data: dict) -> dict:
@@ -621,15 +668,19 @@ async def health(request: Request):
     fallback = str(
         get_binding(env, "GEMINI_FALLBACK_MODEL", FALLBACK_MODEL_DEFAULT)
     ).strip()
+    last_resort = str(
+        get_binding(env, "GEMINI_LAST_RESORT_MODEL", LAST_RESORT_MODEL_DEFAULT)
+    ).strip()
 
     return {
         "status": "ok",
         "model": model or PRIMARY_MODEL_DEFAULT,
         "fallback_model": fallback or FALLBACK_MODEL_DEFAULT,
+        "last_resort_model": last_resort or LAST_RESORT_MODEL_DEFAULT,
         "pdf_direct_vision": True,
         "media_resolution": "high",
         "thinking_level": "high",
-        "pipeline": "discovery + recovery + extraction-verification",
+        "pipeline": "multi-model discovery + recovery + extraction-verification",
         "extractor_version": APP_VERSION,
     }
 
@@ -645,6 +696,13 @@ async def analyze(payload: AnalyzeRequest, request: Request):
     fallback_model = str(
         get_binding(env, "GEMINI_FALLBACK_MODEL", FALLBACK_MODEL_DEFAULT)
     ).strip() or FALLBACK_MODEL_DEFAULT
+    last_resort_model = str(
+        get_binding(env, "GEMINI_LAST_RESORT_MODEL", LAST_RESORT_MODEL_DEFAULT)
+    ).strip() or LAST_RESORT_MODEL_DEFAULT
+    model_chain = []
+    for candidate in [primary_model, fallback_model, last_resort_model]:
+        if candidate and candidate not in model_chain:
+            model_chain.append(candidate)
 
     if not api_key:
         raise HTTPException(
@@ -684,29 +742,13 @@ async def analyze(payload: AnalyzeRequest, request: Request):
     # --------------------------------------------------------
     # PASS 1: EQUIPMENT DISCOVERY
     # --------------------------------------------------------
-    try:
-        discovery_data, discovery_status = await gemini_request(
-            api_key,
-            primary_model,
-            payload.pdf_base64,
-            DISCOVERY_PROMPT,
-            DISCOVERY_SCHEMA,
-        )
-        discovery_model = primary_model
-    except HTTPException as primary_error:
-        # Use the fallback only for transient capacity/server errors.
-        # This prevents a temporary 3.8 capacity spike from blocking the app.
-        if primary_error.status_code not in {502, 503} or fallback_model == primary_model:
-            raise
-
-        discovery_data, discovery_status = await gemini_request(
-            api_key,
-            fallback_model,
-            payload.pdf_base64,
-            DISCOVERY_PROMPT,
-            DISCOVERY_SCHEMA,
-        )
-        discovery_model = fallback_model
+    discovery_data, discovery_model = await gemini_with_fallbacks(
+        api_key,
+        model_chain,
+        payload.pdf_base64,
+        DISCOVERY_PROMPT,
+        DISCOVERY_SCHEMA,
+    )
 
     discovered = discovery_data.get("equipment", [])
     if not isinstance(discovered, list):
@@ -750,9 +792,9 @@ async def analyze(payload: AnalyzeRequest, request: Request):
     # This is the key protection against a false "0 equipment" result.
     if not discovered_clean:
         try:
-            recovery_data, recovery_status = await gemini_request(
+            recovery_data, recovery_model = await gemini_with_fallbacks(
                 api_key,
-                discovery_model,
+                model_chain,
                 payload.pdf_base64,
                 RECOVERY_DISCOVERY_PROMPT,
                 DISCOVERY_SCHEMA,
@@ -800,7 +842,7 @@ async def analyze(payload: AnalyzeRequest, request: Request):
             "filename": payload.filename,
             "equipment_count": 0,
             "equipment": [],
-            "pipeline": "discovery + recovery + extraction-verification",
+            "pipeline": "multi-model discovery + recovery + extraction-verification",
             "model_used": discovery_model,
             "verification": "not_run",
         }
@@ -812,33 +854,13 @@ async def analyze(payload: AnalyzeRequest, request: Request):
         equipment_list=json.dumps(discovered_clean, ensure_ascii=False)
     )
 
-    try:
-        extraction_data, extraction_status = await gemini_request(
-            api_key,
-            discovery_model,
-            payload.pdf_base64,
-            extraction_prompt,
-            EQUIPMENT_SCHEMA,
-        )
-        extraction_model = discovery_model
-    except HTTPException as extraction_error:
-        # If primary was used and the second call hits temporary capacity,
-        # try the fallback once. This is intentionally limited so free-tier
-        # daily request quotas are not consumed by a retry storm.
-        if (
-            extraction_error.status_code not in {502, 503}
-            or discovery_model == fallback_model
-        ):
-            raise
-
-        extraction_data, extraction_status = await gemini_request(
-            api_key,
-            fallback_model,
-            payload.pdf_base64,
-            extraction_prompt,
-            EQUIPMENT_SCHEMA,
-        )
-        extraction_model = fallback_model
+    extraction_data, extraction_model = await gemini_with_fallbacks(
+        api_key,
+        model_chain,
+        payload.pdf_base64,
+        extraction_prompt,
+        EQUIPMENT_SCHEMA,
+    )
 
     raw_equipment = extraction_data.get("equipment", [])
     equipment = normalize_equipment_list(raw_equipment)
@@ -885,7 +907,7 @@ async def analyze(payload: AnalyzeRequest, request: Request):
         "filename": payload.filename,
         "equipment_count": len(ordered),
         "equipment": ordered,
-        "pipeline": "discovery + recovery + extraction-verification",
+        "pipeline": "multi-model discovery + recovery + extraction-verification",
         "model_used": extraction_model,
         "discovery_model": discovery_model,
         "verification": "completed",
