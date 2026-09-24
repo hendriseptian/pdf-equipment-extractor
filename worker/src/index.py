@@ -17,7 +17,7 @@ from pyodide.ffi import to_js
 
 app = FastAPI(
     title="PDF Equipment Extractor",
-    version="0.1.1",
+    version="0.8.0",
     description="Extract equipment data from engineering PDFs using Gemini.",
 )
 
@@ -345,13 +345,13 @@ async def root():
 @app.get("/health")
 async def health(request: Request):
     env = get_env(request)
-    model = get_binding(env, "GEMINI_MODEL", "gemini-3.5-flash-lite")
+    model = get_binding(env, "GEMINI_MODEL", "gemini-3.8-flash")
 
     return {
         "status": "ok",
         "model": str(model),
         "pdf_direct_vision": True,
-        "extractor_version": "0.7.0",
+        "extractor_version": "0.8.0",
     }
 
 
@@ -364,7 +364,7 @@ async def analyze(payload: AnalyzeRequest, request: Request):
     env = get_env(request)
 
     api_key = get_binding(env, "GEMINI_API_KEY")
-    model = get_binding(env, "GEMINI_MODEL", "gemini-3.5-flash-lite")
+    model = get_binding(env, "GEMINI_MODEL", "gemini-3.8-flash")
 
     if not api_key:
         raise HTTPException(
@@ -375,7 +375,7 @@ async def analyze(payload: AnalyzeRequest, request: Request):
     model = str(model).strip()
 
     if not model:
-        model = "gemini-3.5-flash-lite"
+        model = "gemini-3.8-flash"
 
     # --------------------------------------------------------
     # INPUT VALIDATION
@@ -442,9 +442,12 @@ async def analyze(payload: AnalyzeRequest, request: Request):
             }
         ],
         "generationConfig": {
-            "temperature": 0,
             "responseMimeType": "application/json",
             "responseSchema": GEMINI_SCHEMA,
+            "thinkingConfig": {
+                "thinkingLevel": "high",
+            },
+            "media_resolution": "MEDIA_RESOLUTION_MEDIUM",
         },
     }
 
