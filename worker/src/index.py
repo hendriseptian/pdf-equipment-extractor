@@ -17,7 +17,7 @@ from pyodide.ffi import to_js
 # APP
 # ============================================================
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 PRIMARY_MODEL_DEFAULT = "gemini-3.8-flash"
 FALLBACK_MODEL_DEFAULT = "gemini-3.7-flash"
 MAX_PDF_SIZE = 15 * 1024 * 1024
@@ -225,59 +225,100 @@ DISCOVERY_SCHEMA = {
 # ============================================================
 
 DISCOVERY_PROMPT = r"""
-You are the EQUIPMENT DETECTION stage of an engineering P&ID extraction system.
+You are the EQUIPMENT DISCOVERY stage of a professional engineering P&ID
+extraction system.
 
-Inspect the ENTIRE supplied PDF page-by-page.
-Return ONLY major/process equipment that is actually represented on this
-sheet and has a clear equipment identity/tag or equipment title.
+Inspect EVERY PAGE of the supplied PDF visually. Your first priority is to
+find ALL physical process equipment shown on the drawing. Do not extract
+parameters yet.
 
-IMPORTANT:
-This is a P&ID, not an equipment datasheet. The drawing contains many pipes,
-line numbers, valves, instruments, fittings, nozzles, dimensions and ratings.
-Those are NOT equipment.
+A process equipment item normally has one or more of these clues:
+- an equipment tag such as E-2, 1E-2, C-3, 1C-3, V-101, P-101, etc.;
+- an equipment name/title such as COOLER, SEPARATOR, DRUM, VESSEL, COLUMN,
+  TANK, PUMP, COMPRESSOR, HEATER, REACTOR;
+- a recognizable equipment symbol/body with a tag or title nearby;
+- a dedicated equipment data block containing design information.
 
-INCLUDE:
-- heat exchangers / coolers
-- separators
-- drums / vessels
-- columns
+IMPORTANT: equipment tags vary by project. Do NOT assume that only one tag
+prefix is valid. Look at the actual drawing conventions.
+
+INCLUDE physical major/process equipment such as:
+- heat exchangers and coolers
+- separators and drums
+- vessels and columns
 - tanks
 - pumps
 - compressors
-- heaters / furnaces
+- heaters/furnaces
 - reactors
-- other clearly identifiable major process equipment
+- other clearly represented major process equipment
 
 EXCLUDE:
 - valves
 - instruments
-- piping / line numbers
-- fittings
-- flanges
+- piping and line numbers
+- fittings and flanges
 - individual nozzles
 - pipe supports
-- elevations
-- dimensions without an equipment identity
+- dimensions/elevations by themselves
+- utility or line labels that are not equipment
 
-CRITICAL ASSOCIATION RULE:
-Only create a record when the equipment identity belongs to the equipment
-shown on THIS sheet. Do not create an equipment record merely because a tag
-is visible somewhere near piping.
+CRITICAL:
+1. Search the whole page, not only the center of the drawing.
+2. Equipment can be drawn as a symbol/body with its tag above, below, or
+   beside it.
+3. A tag/name close to piping can still identify equipment if the tag/title
+   is clearly associated with the equipment body or equipment data block.
+4. Do not require the equipment name to be present. If a clear equipment tag
+   and equipment body exist, return it with equipment_name="-".
+5. Do not require dimensions, pressure or temperature to identify equipment.
+6. Do not return piping, valves or instruments merely because they have tags.
+7. Do not invent tags. Copy visible tag text exactly.
 
-For every included item:
-- Copy the tag character-for-character.
-- Copy the equipment name only if explicitly shown.
-- Give a simple equipment type such as COOLER, HEAT EXCHANGER, SEPARATOR,
-  DRUM, VESSEL, COLUMN, PUMP, COMPRESSOR, etc.
+For each equipment candidate return:
+- tag_no: exact visible equipment tag; if no tag is visible but the equipment
+  is unmistakably identified by an explicit title, use the title only.
+- equipment_name: exact visible equipment title/name, otherwise "-".
+- type: simple type such as COOLER, HEAT EXCHANGER, SEPARATOR, DRUM, VESSEL,
+  COLUMN, TANK, PUMP, COMPRESSOR, HEATER, REACTOR, or "-".
 
 Do NOT extract pressure, temperature, diameter, length, height, duty or
 service in this stage.
-Do NOT guess.
 
-Before returning the JSON, visually review the whole page once more and
-remove false positives caused by piping/nozzle/instrument labels.
-
+Before returning, scan the entire PDF once more for missed major equipment.
 Return JSON ONLY.
+"""
+
+# A recovery prompt is intentionally broader and is only called when the
+# primary discovery pass returns zero equipment. This prevents a strict
+# first-pass interpretation from causing a false empty result.
+RECOVERY_DISCOVERY_PROMPT = r"""
+You are a SECOND-PASS VISUAL EQUIPMENT FINDER for an engineering P&ID.
+
+The previous detector found zero equipment. Do NOT accept that conclusion.
+Reinspect the entire PDF visually from the beginning.
+
+Find every physical major process equipment body/symbol on the sheet, even if
+its equipment title is separate from the symbol or partly surrounded by
+piping. Search for combinations of:
+- equipment-shaped bodies (vessels, exchangers, drums, columns, tanks);
+- equipment tags;
+- equipment titles;
+- dedicated design-data blocks;
+- explicit equipment dimensions attached to a body.
+
+Typical project tag examples include E-2, 1E-2, C-3, 1C-3, V-101, P-101,
+but these are examples only; use the actual drawing.
+
+Return major physical equipment only. Do NOT return valves, instruments,
+pipe lines, line numbers, fittings, flanges, nozzles, supports, elevations,
+or isolated dimensions.
+
+If a physical equipment body is clearly present and its tag is readable,
+return it even when the title is missing. Use equipment_name="-" when needed.
+Never invent a tag or name.
+
+Return JSON ONLY using the requested schema.
 """
 
 EXTRACTION_PROMPT_TEMPLATE = r"""
@@ -588,7 +629,7 @@ async def health(request: Request):
         "pdf_direct_vision": True,
         "media_resolution": "high",
         "thinking_level": "high",
-        "pipeline": "discovery + extraction-verification",
+        "pipeline": "discovery + recovery + extraction-verification",
         "extractor_version": APP_VERSION,
     }
 
@@ -702,7 +743,56 @@ async def analyze(payload: AnalyzeRequest, request: Request):
         if len(discovered_clean) >= MAX_EQUIPMENT:
             break
 
-    # No equipment is a valid result, but still return the evidence of the
+    # --------------------------------------------------------
+    # DISCOVERY RECOVERY PASS
+    # --------------------------------------------------------
+    # If the strict first pass returns nothing, run one broader visual pass.
+    # This is the key protection against a false "0 equipment" result.
+    if not discovered_clean:
+        try:
+            recovery_data, recovery_status = await gemini_request(
+                api_key,
+                discovery_model,
+                payload.pdf_base64,
+                RECOVERY_DISCOVERY_PROMPT,
+                DISCOVERY_SCHEMA,
+            )
+            recovery_items = recovery_data.get("equipment", [])
+            if isinstance(recovery_items, list):
+                seen = set()
+                for item in recovery_items:
+                    if not isinstance(item, dict):
+                        continue
+
+                    tag = normalize_value(item.get("tag_no"))
+                    name = normalize_value(item.get("equipment_name"))
+                    eq_type = normalize_value(item.get("type"))
+
+                    if tag == "-":
+                        continue
+
+                    key = tag.upper().replace(" ", "")
+                    if key in seen:
+                        continue
+                    seen.add(key)
+
+                    discovered_clean.append({
+                        "tag_no": tag,
+                        "equipment_name": name,
+                        "type": eq_type,
+                    })
+
+                    if len(discovered_clean) >= MAX_EQUIPMENT:
+                        break
+        except HTTPException as recovery_error:
+            # Keep the original discovery result if the recovery call fails.
+            # If both passes fail, the user gets a useful empty result rather
+            # than a fabricated equipment record.
+            if recovery_error.status_code not in {502, 503}:
+                raise
+
+    # No equipment after both visual discovery passes: return evidence rather
+    # than inventing an equipment record.
     # discovery stage rather than inventing an equipment record.
     if not discovered_clean:
         return {
@@ -710,7 +800,7 @@ async def analyze(payload: AnalyzeRequest, request: Request):
             "filename": payload.filename,
             "equipment_count": 0,
             "equipment": [],
-            "pipeline": "discovery + extraction-verification",
+            "pipeline": "discovery + recovery + extraction-verification",
             "model_used": discovery_model,
             "verification": "not_run",
         }
@@ -795,7 +885,7 @@ async def analyze(payload: AnalyzeRequest, request: Request):
         "filename": payload.filename,
         "equipment_count": len(ordered),
         "equipment": ordered,
-        "pipeline": "discovery + extraction-verification",
+        "pipeline": "discovery + recovery + extraction-verification",
         "model_used": extraction_model,
         "discovery_model": discovery_model,
         "verification": "completed",
