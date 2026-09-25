@@ -1,391 +1,707 @@
 from typing import Any
-import asyncio
 import base64
 import json
-import random
-import re
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
+
 from workers import WorkerEntrypoint, Response, asgi
 from js import Object, fetch
 from pyodide.ffi import to_js
 
-APP_VERSION = "1.0.0"
-PRIMARY_MODEL_DEFAULT = "gemini-3.8-flash"
-FALLBACK_MODEL_DEFAULT = "gemini-3.7-flash"
-LAST_RESORT_MODEL_DEFAULT = "gemini-3.5-flash-lite"
-MAX_IMAGE_B64 = 6 * 1024 * 1024
-MAX_TILES = 8
-MAX_TAGS = 300
 
-app = FastAPI(title="Piping Tag Extractor", version=APP_VERSION)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
+# ============================================================
+# APP
+# ============================================================
 
-class Tile(BaseModel):
-    id: str
-    mime_type: str = "image/jpeg"
-    image_base64: str
+app = FastAPI(
+    title="PDF Equipment Extractor",
+    version="0.8.0",
+    description="Extract equipment data from engineering PDFs using Gemini.",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+MAX_PDF_SIZE = 15 * 1024 * 1024
+
+PARAMETER_KEYS = [
+    "tag_no",
+    "equipment_name",
+    "type",
+    "diameter",
+    "diameter_od_id",
+    "length",
+    "length_remarks",
+    "height",
+    "insulation",
+    "insulation_size",
+    "insulation_type",
+    "shell_pressure",
+    "shell_min_temp",
+    "shell_max_temp",
+    "tube_pressure",
+    "tube_min_temp",
+    "tube_max_temp",
+    "service_type",
+    "service_description",
+    "remarks",
+]
+
+
+# ============================================================
+# REQUEST MODEL
+# ============================================================
 
 class AnalyzeRequest(BaseModel):
     filename: str
-    pages: list[dict[str, Any]] = Field(min_length=1, max_length=5)
-
-TAG_SCHEMA = {
-    "type": "OBJECT",
-    "properties": {
-        "drawing_no": {"type": "STRING"},
-        "tags": {
-            "type": "ARRAY",
-            "items": {
-                "type": "OBJECT",
-                "properties": {
-                    "tag_no": {"type": "STRING"},
-                    "size": {"type": "STRING"},
-                    "tile_id": {"type": "STRING"},
-                    "evidence": {"type": "STRING"},
-                },
-                "required": ["tag_no", "size", "tile_id", "evidence"],
-            },
-        },
-    },
-    "required": ["drawing_no", "tags"],
-}
-
-VERIFY_SCHEMA = {
-    "type": "OBJECT",
-    "properties": {
-        "drawing_no": {"type": "STRING"},
-        "tags": {
-            "type": "ARRAY",
-            "items": {
-                "type": "OBJECT",
-                "properties": {
-                    "tag_no": {"type": "STRING"},
-                    "size": {"type": "STRING"},
-                    "status": {"type": "STRING"},
-                    "reason": {"type": "STRING"},
-                },
-                "required": ["tag_no", "size", "status", "reason"],
-            },
-        },
-    },
-    "required": ["drawing_no", "tags"],
-}
-
-PROMPT_DISCOVER = r'''
-You are an expert engineering P&ID line-number extraction system.
-
-The images below come from ONE P&ID sheet. The goal is to extract PIPING / LINE TAGS only.
-Do NOT extract equipment tags, valve tags, instrument tags, dimensions, elevations, notes, reference drawings, or text that is not a piping/line identification.
-
-The drawing is raster/visual. Read the actual characters in the images. Do not rely on assumptions.
-
-IMPORTANT TILE RULE:
-- Inspect EVERY TILE independently.
-- The full-page image is only for context; the tiles are the high-detail source.
-- A tag may be small and near a pipe line.
-- Do not miss tags near page edges or in the lower/title-block areas.
-- The same tag may appear more than once; report it once after checking duplicates.
-
-WHAT COUNTS AS A PIPING TAG:
-A line/piping identification printed along or immediately beside a process/utility pipe, generally containing a line/service/area sequence and often an inch size such as 1", 2", 3", etc. Copy the complete visible tag exactly.
-
-DO NOT use the sample Excel values as data for this PDF. The Excel is only a format reference.
-
-SIZE RULE:
-- If the tag itself contains an inch size such as 1", 2", 1/2", 10", use that size.
-- If a separate line-size label is explicitly associated with the same piping tag, use it.
-- Do NOT use nearby valve size/nozzle size unless it is clearly the line size for that tag.
-- If size cannot be proven, return "-".
-
-DRAWING NUMBER:
-Read the drawing number from the title block if clearly visible. It is common to all rows.
-Do not confuse project number, revision, file name, or job number with drawing number.
-
-EVIDENCE:
-For each tag, briefly state where/how it is visible, e.g. "printed directly on horizontal process line in tile R1C2".
-
-Return JSON only using the supplied schema.
-'''
-
-PROMPT_VERIFY = r'''
-You are the verification stage for an engineering P&ID piping-tag extraction.
-
-You receive the same page images and a preliminary list of candidate piping tags.
-Independently inspect the relevant image areas and verify every candidate.
-
-KEEP a candidate ONLY if it is genuinely a PIPING/LINE TAG printed on or immediately associated with a pipe/line.
-REMOVE candidates that are:
-- equipment tags/numbers;
-- valve tags or valve identifiers;
-- instrument tags;
-- nozzle numbers;
-- dimensions/elevations;
-- reference drawing numbers;
-- notes or revision information;
-- text that is not a line identification.
-
-COPY THE TAG EXACTLY as visually shown. Do not normalize its engineering meaning or invent missing characters.
-
-SIZE:
-Prefer the inch size visibly embedded in the tag. For example, 1HC106-1"-FC2L -> size 1; 1HC1-2"-FG2D -> size 2.
-If a quoted inch size is not visibly present and no explicit associated line size exists, return "-".
-
-DUPLICATES:
-If the same tag appears multiple times, return it only once.
-
-DRAWING NUMBER:
-Verify it from the title block. For this sheet it may look like D1D-A-25; do not assume it unless visually confirmed.
-
-Return only verified tags. If a candidate is uncertain, remove it rather than guessing.
-Return JSON only.
-'''
+    mime_type: str
+    pdf_base64: str
 
 
-def env_value(env: Any, name: str, default: str) -> str:
-    try:
-        value = getattr(env, name)
-        if value is not None and str(value).strip():
-            return str(value).strip()
-    except Exception:
-        pass
-    return default
+# ============================================================
+# HELPERS
+# ============================================================
 
-
-def normalize_text(value: Any) -> str:
+def normalize_value(value: Any) -> str:
     if value is None:
         return "-"
-    s = str(value).strip()
-    s = s.replace("“", '"').replace("”", '"').replace("″", '"')
-    s = re.sub(r"\s+", " ", s)
-    return s or "-"
+
+    text = str(value).strip()
+
+    if not text:
+        return "-"
+
+    if text.lower() in {
+        "null",
+        "none",
+        "n/a",
+        "na",
+        "not available",
+        "not found",
+        "unknown",
+        "undefined",
+    }:
+        return "-"
+
+    return text
 
 
-def size_from_tag(tag: str) -> str | None:
-    if not tag or tag == "-":
-        return None
-    m = re.search(r'(?:^|[-_/])\s*(\d+(?:\.\d+)?(?:\s*/\s*\d+)?)\s*["”″]', tag)
-    if not m:
-        return None
-    return m.group(1).replace(" ", "")
-
-
-def normalize_tags(items: Any) -> list[dict]:
-    if not isinstance(items, list):
-        return []
-    out = []
-    seen = set()
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        tag = normalize_text(item.get("tag_no"))
-        if tag == "-":
-            continue
-        key = re.sub(r"\s+", "", tag).upper()
-        if key in seen:
-            continue
-        seen.add(key)
-        parsed_size = size_from_tag(tag)
-        ai_size = normalize_text(item.get("size"))
-        size = parsed_size or ai_size
-        out.append({
-            "tag_no": tag,
-            "size": size,
-            "tile_id": normalize_text(item.get("tile_id")),
-            "evidence": normalize_text(item.get("evidence")),
-        })
-        if len(out) >= MAX_TAGS:
-            break
-    return out
-
-
-def model_config(model: str) -> dict:
-    cfg = {"responseMimeType": "application/json", "media_resolution": "MEDIA_RESOLUTION_HIGH"}
-    if model.startswith("gemini-3."):
-        cfg["thinkingConfig"] = {"thinkingLevel": "high"}
-    return cfg
-
-async def sleep_retry(seconds: float):
-    await asyncio.sleep(seconds + random.uniform(0, 0.7))
-
-RETRYABLE = {408, 429, 500, 502, 503, 504}
-RETRY_DELAYS = [2.0, 5.0]
-
-def error_message(text: str) -> str:
-    try:
-        obj = json.loads(text)
-        return str(obj.get("error", {}).get("message", text))
-    except Exception:
-        return text or "Gemini API error"
-
-async def gemini_call(api_key: str, model: str, prompt: str, images: list[dict], schema: dict) -> dict:
-    endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-    parts = [{"text": prompt}]
-    for image in images:
-        parts.append({"text": f"IMAGE/TILE ID: {image['id']}"})
-        parts.append({"inline_data": {"mime_type": image["mime_type"], "data": image["data"]}})
-    body = {
-        "contents": [{"role": "user", "parts": parts}],
-        "generationConfig": {**model_config(model), "responseSchema": schema},
-    }
-    options = to_js({"method":"POST","headers":{"Content-Type":"application/json"},"body":json.dumps(body)}, dict_converter=Object.fromEntries)
-    last_status = 502
-    last_msg = "Gemini request failed"
-    for attempt in range(len(RETRY_DELAYS)+1):
-        try:
-            resp = await fetch(endpoint, options)
-            status = int(resp.status)
-            txt = str(await resp.text())
-        except Exception as exc:
-            status, txt = 502, str(exc)
-        if 200 <= status < 300:
-            try:
-                data = json.loads(txt)
-                candidates = data.get("candidates") or []
-                if not candidates:
-                    raise ValueError("Gemini returned no candidates")
-                text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-                return json.loads(text)
-            except Exception as exc:
-                raise HTTPException(502, f"Gemini returned invalid structured output: {exc}")
-        last_status, last_msg = status, error_message(txt)
-        if status not in RETRYABLE or attempt >= len(RETRY_DELAYS):
-            break
-        await sleep_retry(RETRY_DELAYS[attempt])
-    raise HTTPException(503 if last_status in RETRYABLE else 502, f"Gemini API error ({last_status}): {last_msg}")
-
-async def gemini_fallbacks(api_key: str, models: list[str], prompt: str, images: list[dict], schema: dict) -> tuple[dict,str]:
-    last = None
-    for model in models:
-        if not model:
-            continue
-        try:
-            return await gemini_call(api_key, model, prompt, images, schema), model
-        except HTTPException as exc:
-            last = exc
-            if exc.status_code not in {408,429,500,502,503,504}:
-                raise
-    if last:
-        raise last
-    raise HTTPException(503, "No Gemini model configured")
-
-
-def response_headers(request: Request) -> dict:
-    origin = request.headers.get("Origin")
-    allowed = {"https://hendriseptian.github.io", "http://localhost:8787", "http://127.0.0.1:8787"}
+def normalize_equipment(item: dict) -> dict:
     return {
-        "Access-Control-Allow-Origin": origin if origin in allowed else "https://hendriseptian.github.io",
-        "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-        "Access-Control-Allow-Headers": request.headers.get("Access-Control-Request-Headers", "Content-Type"),
-        "Access-Control-Max-Age": "86400",
-        "Vary": "Origin",
+        key: normalize_value(item.get(key))
+        for key in PARAMETER_KEYS
     }
+
+
+def get_env(request: Request) -> Any:
+    env = request.scope.get("env")
+    if env is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Cloudflare environment is unavailable.",
+        )
+    return env
+
+
+def get_binding(env: Any, name: str, default: Any = None) -> Any:
+    try:
+        value = getattr(env, name)
+    except Exception:
+        return default
+
+    if value is None:
+        return default
+
+    return value
+
+
+# ============================================================
+# GEMINI SCHEMA
+# ============================================================
+
+EQUIPMENT_PROPERTIES = {
+    "tag_no": {"type": "STRING"},
+    "equipment_name": {"type": "STRING"},
+    "type": {"type": "STRING"},
+    "diameter": {"type": "STRING"},
+    "diameter_od_id": {"type": "STRING"},
+    "length": {"type": "STRING"},
+    "length_remarks": {"type": "STRING"},
+    "height": {"type": "STRING"},
+    "insulation": {"type": "STRING"},
+    "insulation_size": {"type": "STRING"},
+    "insulation_type": {"type": "STRING"},
+    "shell_pressure": {"type": "STRING"},
+    "shell_min_temp": {"type": "STRING"},
+    "shell_max_temp": {"type": "STRING"},
+    "tube_pressure": {"type": "STRING"},
+    "tube_min_temp": {"type": "STRING"},
+    "tube_max_temp": {"type": "STRING"},
+    "service_type": {"type": "STRING"},
+    "service_description": {"type": "STRING"},
+    "remarks": {"type": "STRING"},
+}
+
+GEMINI_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "equipment": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": EQUIPMENT_PROPERTIES,
+                "required": PARAMETER_KEYS,
+            },
+        }
+    },
+    "required": ["equipment"],
+}
+
+
+# ============================================================
+# EXTRACTION PROMPT
+# ============================================================
+
+EXTRACTION_PROMPT = """
+You are a STRICT engineering P&ID extraction engine.
+
+Analyze the ENTIRE supplied PDF and identify every MAJOR EQUIPMENT item,
+then extract ONLY values visibly and explicitly associated with each exact
+equipment item.
+
+This is a P&ID. It contains many pipe sizes, nozzle sizes, line numbers,
+valve tags, instrument tags, elevations, dimensions, and other numbers.
+Those values are NOT automatically equipment parameters.
+
+============================================================
+EQUIPMENT IDENTIFICATION
+============================================================
+
+Include major/process equipment such as:
+coolers, heat exchangers, separators, drums, vessels, tanks, columns,
+pumps, compressors, heaters, reactors, and similar equipment.
+
+Do NOT create equipment records for:
+valves, instruments, piping, fittings, flanges, reducers, elbows,
+nozzles by themselves, pipe sizes, or line numbers.
+
+The equipment TAG must be copied CHARACTER-FOR-CHARACTER from the drawing.
+Never reinterpret or invent a tag.
+
+============================================================
+EQUIPMENT DATA ASSOCIATION
+============================================================
+
+For each equipment item, locate the data block/table/text that is
+VISUALLY ASSOCIATED with that exact equipment.
+
+A value is valid only if the drawing clearly associates it with that
+equipment.
+
+Do NOT copy a value merely because it is nearby, connected by piping,
+belongs to a nozzle, belongs to another equipment item, or appears elsewhere.
+
+If association is uncertain, return "-".
+
+============================================================
+DIMENSIONS
+============================================================
+
+DIAMETER:
+Extract only the equipment's own explicitly shown diameter.
+
+Examples:
+10'-0" Ø
+10'-0" DIA
+10'-0" DIAMETER
+
+NEVER use pipe/nozzle sizes such as 2", 3", 4", 6", 8", 12" as equipment
+diameter unless the drawing explicitly identifies that value as the
+equipment diameter.
+
+LENGTH:
+Extract only the equipment/vessel length explicitly shown for that equipment.
+
+For:
+10'-0" Ø × 9'-0" T-T
+use diameter = 10'-0"
+length = 9'-0"
+length_remarks = T-T
+
+For:
+10'-0" Ø × 40'-6" T/T
+use diameter = 10'-0"
+length = 40'-6"
+length_remarks = T/T
+
+Do not use pipe dimensions, elevations, nozzle dimensions, or unrelated
+drawing dimensions as equipment length.
+
+HEIGHT:
+Populate only when an explicit equipment height is shown.
+Do not substitute an elevation or piping dimension.
+
+============================================================
+PRESSURE AND TEMPERATURE
+============================================================
+
+Use ONLY design pressure and temperature explicitly belonging to the exact
+equipment.
+
+NEVER copy pressure or temperature from:
+- connected piping
+- valve/flange ratings
+- nozzle data
+- another equipment item
+
+For vessels, separators and drums:
+put explicitly stated vessel design pressure in shell_pressure.
+Tube-side fields are "-".
+
+For coolers/heat exchangers:
+keep shell-side and tube-side pressure and temperature completely separate.
+
+If one design temperature is shown without min/max distinction, do not invent
+a minimum temperature.
+
+============================================================
+INSULATION
+============================================================
+
+If the equipment's own data explicitly says NONE:
+insulation = "No"
+
+If insulation is explicitly indicated:
+insulation = "Yes"
+
+Otherwise:
+insulation = "-"
+
+============================================================
+SERVICE
+============================================================
+
+Use service_type only when explicitly supported by the drawing.
+Use service_description only when explicitly stated.
+Do not infer service/fluid from the equipment name.
+
+============================================================
+DUTY
+============================================================
+
+If DUTY is explicitly shown and there is no dedicated field, preserve it in
+remarks.
+
+============================================================
+MISSING / UNCERTAIN VALUES
+============================================================
+
+If a value is missing, unclear, unreadable, ambiguous, not applicable, or
+not explicitly associated with the equipment, return exactly "-".
+
+NEVER estimate.
+NEVER calculate.
+NEVER guess.
+
+============================================================
+FINAL SELF-CHECK
+============================================================
+
+Before returning each equipment object verify:
+
+1. Tag exactly matches the drawing.
+2. Name belongs to that exact tag.
+3. Diameter is equipment diameter, not pipe/nozzle size.
+4. Length is equipment length.
+5. Pressure belongs to that exact equipment.
+6. Temperature belongs to that exact equipment.
+7. Values were not copied from another equipment item.
+8. Any uncertain field is "-".
+
+Return JSON ONLY according to the supplied schema.
+"""
+
+
+# ============================================================
+# ROUTES
+# ============================================================
+
+@app.get("/")
+async def root():
+    return {
+        "service": "PDF Equipment Extractor",
+        "status": "ok",
+        "version": "0.1.1",
+    }
+
 
 @app.get("/health")
 async def health(request: Request):
-    env = request.scope.get("env")
+    env = get_env(request)
+    model = get_binding(env, "GEMINI_MODEL", "gemini-3.8-flash")
+
     return {
-        "status":"ok",
-        "model":env_value(env,"GEMINI_MODEL",PRIMARY_MODEL_DEFAULT),
-        "fallback_model":env_value(env,"GEMINI_FALLBACK_MODEL",FALLBACK_MODEL_DEFAULT),
-        "last_resort_model":env_value(env,"GEMINI_LAST_RESORT_MODEL",LAST_RESORT_MODEL_DEFAULT),
-        "pipeline":"PDF.js high-resolution tiling + multi-model vision + verification",
-        "extractor_version":APP_VERSION,
-        "output":"Piping Tag / P&ID No. / Size",
-        "line_description":"blank",
+        "status": "ok",
+        "model": str(model),
+        "pdf_direct_vision": True,
+        "extractor_version": "0.8.0",
     }
 
-@app.post("/api/analyze-piping")
-async def analyze_piping(payload: AnalyzeRequest, request: Request):
-    env = request.scope.get("env")
-    api_key = env_value(env, "GEMINI_API_KEY", "")
+
+@app.post("/api/analyze")
+async def analyze(payload: AnalyzeRequest, request: Request):
+    # --------------------------------------------------------
+    # ENV / SECRET
+    # --------------------------------------------------------
+
+    env = get_env(request)
+
+    api_key = get_binding(env, "GEMINI_API_KEY")
+    model = get_binding(env, "GEMINI_MODEL", "gemini-3.8-flash")
+
     if not api_key:
-        raise HTTPException(500, "GEMINI_API_KEY secret is not configured.")
-    if not payload.pages:
-        raise HTTPException(400, "No rendered PDF pages supplied.")
+        raise HTTPException(
+            status_code=500,
+            detail="GEMINI_API_KEY is not configured.",
+        )
 
-    primary = env_value(env,"GEMINI_MODEL",PRIMARY_MODEL_DEFAULT)
-    fallback = env_value(env,"GEMINI_FALLBACK_MODEL",FALLBACK_MODEL_DEFAULT)
-    last = env_value(env,"GEMINI_LAST_RESORT_MODEL",LAST_RESORT_MODEL_DEFAULT)
+    model = str(model).strip()
 
-    all_tags = []
-    drawing_numbers = []
-    page_reports = []
+    if not model:
+        model = "gemini-3.8-flash"
 
-    for page in payload.pages:
-        page_no = int(page.get("page_no", 1))
-        full_page = page.get("full_page") or {}
-        tiles = page.get("tiles") or []
-        images = []
-        if full_page.get("data"):
-            images.append({"id": f"P{page_no}-FULL", "mime_type": full_page.get("mime_type","image/jpeg"), "data": full_page["data"]})
-        for tile in tiles[:MAX_TILES]:
-            if tile.get("data"):
-                images.append({"id": tile.get("id", f"P{page_no}-TILE"), "mime_type": tile.get("mime_type","image/jpeg"), "data": tile["data"]})
-        if not images:
-            continue
+    # --------------------------------------------------------
+    # INPUT VALIDATION
+    # --------------------------------------------------------
 
-        discovery, model1 = await gemini_fallbacks(api_key,[primary,fallback,last],PROMPT_DISCOVER,images,TAG_SCHEMA)
-        candidates = normalize_tags(discovery.get("tags"))
-        drawing = normalize_text(discovery.get("drawing_no"))
-        if drawing != "-": drawing_numbers.append(drawing)
+    if payload.mime_type.lower().strip() != "application/pdf":
+        raise HTTPException(
+            status_code=400,
+            detail="Only application/pdf is supported.",
+        )
 
-        candidate_text = json.dumps({"drawing_no": drawing, "tags": candidates}, ensure_ascii=False)
-        verify_prompt = PROMPT_VERIFY + "\nPRELIMINARY CANDIDATES:\n" + candidate_text
-        verified, model2 = await gemini_fallbacks(api_key,[primary,fallback,last],verify_prompt,images,VERIFY_SCHEMA)
-        verified_tags = normalize_tags(verified.get("tags"))
-        vdrawing = normalize_text(verified.get("drawing_no"))
-        if vdrawing != "-": drawing_numbers.append(vdrawing)
-        all_tags.extend(verified_tags)
-        page_reports.append({"page":page_no,"discovery_model":model1,"verification_model":model2,"candidate_count":len(candidates),"verified_count":len(verified_tags)})
+    try:
+        pdf_bytes = base64.b64decode(
+            payload.pdf_base64,
+            validate=True,
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid PDF Base64 data.",
+        )
 
-    # Global dedupe + deterministic size extraction from the exact tag string.
-    final = []
-    seen = set()
-    for item in all_tags:
-        tag = normalize_text(item.get("tag_no"))
-        key = re.sub(r"\s+", "", tag).upper()
-        if key in seen or tag == "-":
-            continue
-        seen.add(key)
-        parsed = size_from_tag(tag)
-        size = parsed or normalize_text(item.get("size"))
-        final.append({"tag_no":tag,"pid_no":"-","from":"","to":"","size":size,"evidence":normalize_text(item.get("evidence"))})
-        if len(final) >= MAX_TAGS:
-            break
+    if not pdf_bytes:
+        raise HTTPException(
+            status_code=400,
+            detail="PDF file is empty.",
+        )
 
-    pid = "-"
-    # Prefer a drawing number that looks like the title-block drawing number; otherwise first verified value.
-    for candidate in drawing_numbers:
-        if candidate != "-":
-            pid = candidate
-            break
-    for row in final:
-        row["pid_no"] = pid
+    if len(pdf_bytes) > MAX_PDF_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail="PDF is larger than the 15 MB limit.",
+        )
 
-    final.sort(key=lambda x: x["tag_no"])
-    return {
-        "status":"ok",
-        "filename":payload.filename,
-        "drawing_no":pid,
-        "count":len(final),
-        "piping_tags":final,
-        "pages":page_reports,
-        "line_description_blank":True,
+    if not pdf_bytes.startswith(b"%PDF"):
+        raise HTTPException(
+            status_code=400,
+            detail="Uploaded file does not appear to be a valid PDF.",
+        )
+
+    # --------------------------------------------------------
+    # GEMINI REQUEST
+    # --------------------------------------------------------
+
+    endpoint = (
+        "https://generativelanguage.googleapis.com/"
+        f"v1beta/models/{model}:generateContent"
+        f"?key={api_key}"
+    )
+
+    request_body = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {"text": EXTRACTION_PROMPT},
+                    {
+                        "inline_data": {
+                            "mime_type": "application/pdf",
+                            "data": payload.pdf_base64,
+                        }
+                    },
+                ],
+            }
+        ],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseSchema": GEMINI_SCHEMA,
+            "thinkingConfig": {
+                "thinkingLevel": "high",
+            },
+            "media_resolution": "MEDIA_RESOLUTION_MEDIUM",
+        },
     }
+
+    # Cloudflare Python Workers uses Pyodide FFI for JavaScript APIs.
+    # Explicitly convert the Python options object to a JS object.
+    fetch_options = to_js(
+        {
+            "method": "POST",
+            "headers": {
+                "Content-Type": "application/json",
+            },
+            "body": json.dumps(request_body),
+        },
+        dict_converter=Object.fromEntries,
+    )
+
+    # --------------------------------------------------------
+    # CALL GEMINI
+    # --------------------------------------------------------
+
+    try:
+        response = await fetch(endpoint, fetch_options)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Gemini connection failed: {exc}",
+        )
+
+    # --------------------------------------------------------
+    # READ RESPONSE
+    # --------------------------------------------------------
+
+    try:
+        status_code = int(response.status)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not read Gemini HTTP status: {exc}",
+        )
+
+    try:
+        response_text = str(await response.text())
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not read Gemini response body: {exc}",
+        )
+
+    if status_code < 200 or status_code >= 300:
+        try:
+            error_data = json.loads(response_text)
+            error_message = (
+                error_data.get("error", {}).get(
+                    "message",
+                    response_text,
+                )
+            )
+        except Exception:
+            error_message = response_text
+
+        raise HTTPException(
+            status_code=502,
+            detail=f"Gemini API error ({status_code}): {error_message}",
+        )
+
+    # --------------------------------------------------------
+    # PARSE GEMINI JSON
+    # --------------------------------------------------------
+
+    try:
+        gemini_data = json.loads(response_text)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Gemini returned non-JSON response: {exc}",
+        )
+
+    try:
+        candidates = gemini_data.get("candidates") or []
+
+        if not candidates:
+            raise ValueError("No candidates returned.")
+
+        parts = (
+            candidates[0]
+            .get("content", {})
+            .get("parts", [])
+        )
+
+        generated_text = ""
+
+        for part in parts:
+            if isinstance(part, dict) and part.get("text"):
+                generated_text = part["text"]
+                break
+
+        if not generated_text:
+            raise ValueError("No text part returned.")
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not extract Gemini result: {exc}",
+        )
+
+    try:
+        result = json.loads(generated_text)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Gemini returned invalid structured JSON: {exc}",
+        )
+
+    # --------------------------------------------------------
+    # NORMALIZE RESULT
+    # --------------------------------------------------------
+
+    raw_equipment = result.get("equipment", [])
+
+    if not isinstance(raw_equipment, list):
+        raise HTTPException(
+            status_code=502,
+            detail="Gemini result does not contain an equipment array.",
+        )
+
+    equipment = [
+        normalize_equipment(item)
+        for item in raw_equipment
+        if isinstance(item, dict)
+    ]
+
+    return {
+        "status": "ok",
+        "filename": payload.filename,
+        "equipment_count": len(equipment),
+        "equipment": equipment,
+    }
+
+
+# ============================================================
+# CLOUDFLARE PYTHON WORKER ENTRYPOINT
+# ============================================================
+#
+# CORS is handled OUTSIDE FastAPI at the Worker boundary.
+# This is important because the browser request originates
+# from GitHub Pages while the API is on workers.dev.
+#
+# The frontend sends application/json, so the browser performs
+# an OPTIONS preflight before POST /api/analyze.
+# ============================================================
 
 class Default(WorkerEntrypoint):
     async def fetch(self, request):
+        origin = request.headers.get("Origin")
+
+        # Allow the current GitHub Pages frontend.
+        # Keep localhost origins for future local testing.
+        allowed_origins = {
+            "https://hendriseptian.github.io",
+            "http://localhost:8787",
+            "http://127.0.0.1:8787",
+        }
+
+        allow_origin = (
+            origin
+            if origin in allowed_origins
+            else "https://hendriseptian.github.io"
+        )
+
+        cors_headers = {
+            "Access-Control-Allow-Origin": allow_origin,
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization",
+            "Access-Control-Max-Age": "86400",
+            "Vary": "Origin",
+        }
+
+        # ----------------------------------------------------
+        # CORS PREFLIGHT
+        # ----------------------------------------------------
         if request.method == "OPTIONS":
-            h = response_headers(request)
-            return Response("", status=204, headers=h)
+            requested_headers = request.headers.get(
+                "Access-Control-Request-Headers"
+            )
+
+            if requested_headers:
+                cors_headers["Access-Control-Allow-Headers"] = (
+                    requested_headers
+                )
+
+            requested_method = request.headers.get(
+                "Access-Control-Request-Method"
+            )
+
+            if requested_method:
+                cors_headers["Access-Control-Allow-Methods"] = (
+                    requested_method
+                ) + ", OPTIONS"
+
+            return Response(
+                "",
+                status=204,
+                headers=cors_headers,
+            )
+
+        # ----------------------------------------------------
+        # FASTAPI / ASGI
+        # ----------------------------------------------------
         try:
-            resp = await asgi.fetch(app, request, self.env)
-            h = response_headers(request)
-            for k,v in h.items():
-                resp.headers.set(k,v)
-            return resp
+            response = await asgi.fetch(
+                app,
+                request,
+                self.env,
+            )
+
+            # Cloudflare Workers allows response headers to be
+            # modified on the response object. This avoids
+            # rebuilding the response body/stream.
+            response.headers.set(
+                "Access-Control-Allow-Origin",
+                allow_origin,
+            )
+            response.headers.set(
+                "Access-Control-Allow-Methods",
+                "GET, POST, OPTIONS",
+            )
+            response.headers.set(
+                "Access-Control-Allow-Headers",
+                "Content-Type, Authorization",
+            )
+            response.headers.set(
+                "Access-Control-Max-Age",
+                "86400",
+            )
+            response.headers.set(
+                "Vary",
+                "Origin",
+            )
+
+            return response
+
         except Exception as exc:
-            return Response(json.dumps({"detail":str(exc)}), status=500, headers={**response_headers(request),"Content-Type":"application/json"})
+            error_body = json.dumps(
+                {
+                    "detail": "Worker internal error.",
+                    "error": str(exc),
+                }
+            )
+
+            return Response(
+                error_body,
+                status=500,
+                headers={
+                    **cors_headers,
+                    "Content-Type": "application/json",
+                },
+            )
